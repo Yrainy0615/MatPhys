@@ -1,0 +1,3 @@
+[submodule "third_party/Cupid"]
+	path = third_party/Cupid
+	url = https://github.com/cupid3d/Cupid.git

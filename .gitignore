@@ -1,16 +1,49 @@
-/experiments    
+/experiments
 /experiments_optimization
+/experiments_k_teacher
 /gaussian_output
 /gaussian_output_video
+/temp_experiments
+/results
+/checkpoints
+/wandb
 /data
 /data_process/TRELLIS
-/wandb
-/temp_experiments
 /semantic/cache
+/semantic/tb_logs
+/semantic/vis_out
+/semantic/runtime
+/semantic/springs.ply
+/__pycache__
+/.warp_cache
+/.claude/
+/.cursor/
+
+# OS/editor noise
+.DS_Store
+._*
+
+# Python caches
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+
+# Large model and artifact files
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Generated data/checkpoint artifacts
+*.npz
+*.npy
+*.pkl
+
+# Local geometry / render outputs
+*.glb
+
+# External checkpoints downloaded locally
 data_process/groundedSAM_checkpoints/groundingdino_swint_ogc.pth
 data_process/groundedSAM_checkpoints/sam2.1_hiera_large.pt
-checkpoints
-semantic/tb_logs
-#pyc 
-*.pyc
-/experiments_k_teacher
