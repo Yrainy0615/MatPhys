@@ -59,6 +59,11 @@ class Config:
 
         # Other parameters for visualization
         self.overlay_path = None
+        self.bg_img_path = "data/bg.png"
+        # DINO node cluster mask for per-cluster topology (semantic/cache/{case}_node_cluster.npy)
+        self.sem_cache_dir = "semantic/cache"
+        # Optional explicit topology checkpoint/path used by inference-only tools.
+        self.explicit_topology_path = None
 
     def to_dict(self):
         # Convert the class to dictionary

@@ -1,10 +1,20 @@
 import numpy as np
 import torch
+import warnings
 from qqtt.utils import logger, cfg
 import warp as wp
 
+warnings.filterwarnings(
+    "ignore",
+    message=r".*recorded kernel apply_picked_points_cluster is configured with the option 'enable_backward=False'.*",
+    category=UserWarning,
+)
+
 wp.init()
-wp.set_device("cuda:0")
+_warp_has_cuda = wp.is_cuda_available()
+wp.set_device("cuda:0" if _warp_has_cuda else "cpu")
+if not _warp_has_cuda:
+    cfg.use_graph = False
 if not cfg.use_graph:
     wp.config.mode = "debug"
     wp.config.verbose = True
@@ -510,6 +520,76 @@ def set_int(input: int, output: wp.array(dtype=wp.int32)):
 
 
 @wp.kernel(enable_backward=False)
+def set_vec3_value(input: wp.vec3, output: wp.array(dtype=wp.vec3)):
+    output[0] = input
+
+
+@wp.kernel(enable_backward=False)
+def set_float_value(input: float, output: wp.array(dtype=wp.float32)):
+    output[0] = input
+
+
+@wp.kernel(enable_backward=False)
+def apply_picked_point(
+    active: wp.array(dtype=wp.int32),
+    picked_idx: wp.array(dtype=wp.int32),
+    picked_pos: wp.array(dtype=wp.vec3),
+    x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    if active[0] == 1 and tid == picked_idx[0]:
+        x[tid] = picked_pos[0]
+        v[tid] = wp.vec3(0.0, 0.0, 0.0)
+
+
+@wp.kernel(enable_backward=False)
+def apply_picked_points_cluster(
+    active: wp.array(dtype=wp.int32),
+    picked_count: wp.array(dtype=wp.int32),
+    picked_indices: wp.array(dtype=wp.int32),
+    picked_weights: wp.array(dtype=wp.float32),
+    picked_original_points: wp.array(dtype=wp.vec3),
+    picked_center_original: wp.array(dtype=wp.vec3),
+    picked_center_target: wp.array(dtype=wp.vec3),
+    x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    if active[0] != 1:
+        return
+
+    count = picked_count[0]
+    delta = picked_center_target[0] - picked_center_original[0]
+    for i in range(count):
+        if tid == picked_indices[i]:
+            x[tid] = picked_original_points[i] + picked_weights[i] * delta
+            v[tid] = wp.vec3(0.0, 0.0, 0.0)
+            return
+
+
+@wp.kernel(enable_backward=False)
+def apply_temp_controller_force(
+    active: wp.array(dtype=wp.int32),
+    picked_idx: wp.array(dtype=wp.int32),
+    controller_point: wp.array(dtype=wp.vec3),
+    controller_k: wp.array(dtype=wp.float32),
+    controller_damping: wp.array(dtype=wp.float32),
+    x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+    f: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    if active[0] != 1 or tid != picked_idx[0]:
+        return
+
+    displacement = controller_point[0] - x[tid]
+    vel_error = -v[tid]
+    force = controller_k[0] * displacement + controller_damping[0] * vel_error
+    wp.atomic_add(f, tid, force)
+
+
+@wp.kernel(enable_backward=False)
 def update_acc(
     v1: wp.array(dtype=wp.vec3),
     v2: wp.array(dtype=wp.vec3),
@@ -710,7 +790,6 @@ class SpringMassSystemWarp:
                 self.object_collision_flag = 1
 
         if self_collision:
-            assert init_masks is None
             self.object_collision_flag = 1
             # Make all points as the collision points
             init_masks = torch.arange(
@@ -761,12 +840,54 @@ class SpringMassSystemWarp:
             self.prev_acc = wp.zeros_like(self.wp_init_vertices, requires_grad=False)
             self.acc_count = wp.zeros(1, dtype=wp.int32, requires_grad=False)
 
+        current_gt_frame = 1 if self.gt_object_points.shape[0] > 1 else 0
         self.wp_current_object_points = wp.from_torch(
-            self.gt_object_points[1].clone(), dtype=wp.vec3, requires_grad=False
+            self.gt_object_points[current_gt_frame].clone(),
+            dtype=wp.vec3,
+            requires_grad=False,
+        )
+        self.wp_picked_original_point = wp.zeros(
+            1, dtype=wp.vec3, requires_grad=False
+        )
+        self.wp_picked_target_point = wp.zeros(1, dtype=wp.vec3, requires_grad=False)
+        self.wp_picked_step_point = wp.zeros(1, dtype=wp.vec3, requires_grad=False)
+        self.wp_picked_object_idx = wp.zeros(1, dtype=wp.int32, requires_grad=False)
+        self.wp_picked_object_active = wp.zeros(1, dtype=wp.int32, requires_grad=False)
+        self.max_picked_object_points = 32
+        self.wp_picked_object_count = wp.zeros(
+            1, dtype=wp.int32, requires_grad=False
+        )
+        self.wp_picked_object_indices = wp.zeros(
+            self.max_picked_object_points, dtype=wp.int32, requires_grad=False
+        )
+        self.wp_picked_object_weights = wp.zeros(
+            self.max_picked_object_points, dtype=wp.float32, requires_grad=False
+        )
+        self.wp_picked_object_original_points = wp.zeros(
+            self.max_picked_object_points, dtype=wp.vec3, requires_grad=False
+        )
+        self.wp_temp_controller_active = wp.zeros(
+            1, dtype=wp.int32, requires_grad=False
+        )
+        self.wp_temp_controller_idx = wp.zeros(1, dtype=wp.int32, requires_grad=False)
+        self.wp_temp_controller_original_point = wp.zeros(
+            1, dtype=wp.vec3, requires_grad=False
+        )
+        self.wp_temp_controller_target_point = wp.zeros(
+            1, dtype=wp.vec3, requires_grad=False
+        )
+        self.wp_temp_controller_step_point = wp.zeros(
+            1, dtype=wp.vec3, requires_grad=False
+        )
+        self.wp_temp_controller_k = wp.zeros(1, dtype=wp.float32, requires_grad=False)
+        self.wp_temp_controller_damping = wp.zeros(
+            1, dtype=wp.float32, requires_grad=False
         )
         if cfg.data_type == "real":
+            current_vis_frame = 1 if self.gt_object_visibilities.shape[0] > 1 else 0
+            current_ctrl_frame = 1 if self.controller_points.shape[0] > 1 else 0
             self.wp_current_object_visibilities = wp.from_torch(
-                self.gt_object_visibilities[1].clone(),
+                self.gt_object_visibilities[current_vis_frame].clone(),
                 dtype=wp.int32,
                 requires_grad=False,
             )
@@ -775,14 +896,18 @@ class SpringMassSystemWarp:
                 dtype=wp.int32,
                 requires_grad=False,
             )
-            self.num_valid_visibilities = int(self.gt_object_visibilities[1].sum())
+            self.num_valid_visibilities = int(
+                self.gt_object_visibilities[current_vis_frame].sum()
+            )
             self.num_valid_motions = int(self.gt_object_motions_valid[0].sum())
 
             self.wp_original_control_point = wp.from_torch(
                 self.controller_points[0].clone(), dtype=wp.vec3, requires_grad=False
             )
             self.wp_target_control_point = wp.from_torch(
-                self.controller_points[1].clone(), dtype=wp.vec3, requires_grad=False
+                self.controller_points[current_ctrl_frame].clone(),
+                dtype=wp.vec3,
+                requires_grad=False,
             )
 
             self.chamfer_loss = wp.zeros(1, dtype=wp.float32, requires_grad=True)
@@ -956,6 +1081,163 @@ class SpringMassSystemWarp:
             outputs=[self.wp_target_control_point],
         )
 
+    def set_picked_object_interactive(
+        self,
+        picked_idx,
+        last_picked_pos,
+        picked_pos,
+        picked_indices=None,
+        picked_weights=None,
+        picked_original_points=None,
+    ):
+        wp.launch(
+            set_int,
+            dim=1,
+            inputs=[1],
+            outputs=[self.wp_picked_object_active],
+        )
+        wp.launch(
+            set_int,
+            dim=1,
+            inputs=[picked_idx],
+            outputs=[self.wp_picked_object_idx],
+        )
+        wp.launch(
+            set_vec3_value,
+            dim=1,
+            inputs=[wp.vec3(*last_picked_pos.tolist())],
+            outputs=[self.wp_picked_original_point],
+        )
+        wp.launch(
+            set_vec3_value,
+            dim=1,
+            inputs=[wp.vec3(*picked_pos.tolist())],
+            outputs=[self.wp_picked_target_point],
+        )
+        if (
+            picked_indices is None
+            or picked_weights is None
+            or picked_original_points is None
+        ):
+            picked_indices = np.array([picked_idx], dtype=np.int32)
+            picked_weights = np.array([1.0], dtype=np.float32)
+            picked_original_points = np.asarray(
+                [last_picked_pos], dtype=np.float32
+            )
+
+        count = min(len(picked_indices), self.max_picked_object_points)
+        picked_indices_t = torch.as_tensor(
+            picked_indices[:count], dtype=torch.int32, device=self.device
+        ).contiguous()
+        picked_weights_t = torch.as_tensor(
+            picked_weights[:count], dtype=torch.float32, device=self.device
+        ).contiguous()
+        picked_original_points_t = torch.as_tensor(
+            picked_original_points[:count], dtype=torch.float32, device=self.device
+        ).contiguous()
+
+        wp.launch(
+            set_int,
+            dim=1,
+            inputs=[count],
+            outputs=[self.wp_picked_object_count],
+        )
+        wp.launch(
+            copy_int,
+            dim=count,
+            inputs=[wp.from_torch(picked_indices_t, dtype=wp.int32, requires_grad=False)],
+            outputs=[self.wp_picked_object_indices],
+        )
+        wp.launch(
+            copy_float,
+            dim=count,
+            inputs=[
+                wp.from_torch(
+                    picked_weights_t, dtype=wp.float32, requires_grad=False
+                )
+            ],
+            outputs=[self.wp_picked_object_weights],
+        )
+        wp.launch(
+            copy_vec3,
+            dim=count,
+            inputs=[
+                wp.from_torch(
+                    picked_original_points_t,
+                    dtype=wp.vec3,
+                    requires_grad=False,
+                )
+            ],
+            outputs=[self.wp_picked_object_original_points],
+        )
+
+    def clear_picked_object_interactive(self):
+        wp.launch(
+            set_int,
+            dim=1,
+            inputs=[0],
+            outputs=[self.wp_picked_object_active],
+        )
+        wp.launch(
+            set_int,
+            dim=1,
+            inputs=[0],
+            outputs=[self.wp_picked_object_count],
+        )
+
+    def set_temp_controller_interactive(
+        self,
+        picked_idx,
+        last_picked_pos,
+        picked_pos,
+        controller_k,
+        controller_damping,
+    ):
+        wp.launch(
+            set_int,
+            dim=1,
+            inputs=[1],
+            outputs=[self.wp_temp_controller_active],
+        )
+        wp.launch(
+            set_int,
+            dim=1,
+            inputs=[picked_idx],
+            outputs=[self.wp_temp_controller_idx],
+        )
+        wp.launch(
+            set_vec3_value,
+            dim=1,
+            inputs=[wp.vec3(*last_picked_pos.tolist())],
+            outputs=[self.wp_temp_controller_original_point],
+        )
+        wp.launch(
+            set_vec3_value,
+            dim=1,
+            inputs=[wp.vec3(*picked_pos.tolist())],
+            outputs=[self.wp_temp_controller_target_point],
+        )
+        wp.launch(
+            set_float_value,
+            dim=1,
+            inputs=[controller_k],
+            outputs=[self.wp_temp_controller_k],
+        )
+        wp.launch(
+            set_float_value,
+            dim=1,
+            inputs=[controller_damping],
+            outputs=[self.wp_temp_controller_damping],
+        )
+
+    def clear_temp_controller_interactive(self):
+        wp.launch(
+            set_int,
+            dim=1,
+            inputs=[0],
+            outputs=[self.wp_temp_controller_active],
+        )
+
     def set_init_state(self, wp_x, wp_v, pure_inference=False):
         # Detach and clone and set requires_grad=True
         assert (
@@ -1032,6 +1314,31 @@ class SpringMassSystemWarp:
     def step(self):
         for i in range(self.num_substeps):
             self.wp_states[i].clear_forces()
+            wp.launch(
+                set_control_points,
+                dim=1,
+                inputs=[
+                    self.num_substeps,
+                    self.wp_picked_original_point,
+                    self.wp_picked_target_point,
+                    i,
+                ],
+                outputs=[self.wp_picked_step_point],
+            )
+            wp.launch(
+                apply_picked_points_cluster,
+                dim=self.num_object_points,
+                inputs=[
+                    self.wp_picked_object_active,
+                    self.wp_picked_object_count,
+                    self.wp_picked_object_indices,
+                    self.wp_picked_object_weights,
+                    self.wp_picked_object_original_points,
+                    self.wp_picked_original_point,
+                    self.wp_picked_step_point,
+                ],
+                outputs=[self.wp_states[i].wp_x, self.wp_states[i].wp_v],
+            )
             if not self.controller_points is None:
                 # Set the control point
                 wp.launch(
@@ -1045,6 +1352,17 @@ class SpringMassSystemWarp:
                     ],
                     outputs=[self.wp_states[i].wp_control_x],
                 )
+            wp.launch(
+                set_control_points,
+                dim=1,
+                inputs=[
+                    self.num_substeps,
+                    self.wp_temp_controller_original_point,
+                    self.wp_temp_controller_target_point,
+                    i,
+                ],
+                outputs=[self.wp_temp_controller_step_point],
+            )
 
             # Calculate the spring forces
             if self.use_edge_gating:
@@ -1087,6 +1405,20 @@ class SpringMassSystemWarp:
                     ],
                     outputs=[self.wp_states[i].wp_vertice_forces],
                 )
+            wp.launch(
+                apply_temp_controller_force,
+                dim=self.num_object_points,
+                inputs=[
+                    self.wp_temp_controller_active,
+                    self.wp_temp_controller_idx,
+                    self.wp_temp_controller_step_point,
+                    self.wp_temp_controller_k,
+                    self.wp_temp_controller_damping,
+                    self.wp_states[i].wp_x,
+                    self.wp_states[i].wp_v,
+                ],
+                outputs=[self.wp_states[i].wp_vertice_forces],
+            )
 
             if self.object_collision_flag:
                 output_v = self.wp_states[i].wp_v_before_collision
@@ -1138,6 +1470,20 @@ class SpringMassSystemWarp:
                     self.wp_collide_fric,
                     self.dt,
                     self.reverse_factor,
+                ],
+                outputs=[self.wp_states[i + 1].wp_x, self.wp_states[i + 1].wp_v],
+            )
+            wp.launch(
+                apply_picked_points_cluster,
+                dim=self.num_object_points,
+                inputs=[
+                    self.wp_picked_object_active,
+                    self.wp_picked_object_count,
+                    self.wp_picked_object_indices,
+                    self.wp_picked_object_weights,
+                    self.wp_picked_object_original_points,
+                    self.wp_picked_original_point,
+                    self.wp_picked_step_point,
                 ],
                 outputs=[self.wp_states[i + 1].wp_x, self.wp_states[i + 1].wp_v],
             )

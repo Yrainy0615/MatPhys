@@ -1,11 +1,63 @@
+import os
+
 import open3d as o3d
 import numpy as np
 import torch
 import time
 import cv2
 from .config import cfg
-import pyrender
-import trimesh
+
+
+def _render_frame_projected(
+    points,
+    colors,
+    intrinsic,
+    w2c,
+    width,
+    height,
+    overlay_path=None,
+    frame_idx=None,
+    point_radius=2,
+):
+    """Headless fallback renderer: project points and splat colored circles."""
+    if overlay_path is not None and frame_idx is not None:
+        image_path = f"{overlay_path}/{frame_idx}.png"
+        overlay = cv2.imread(image_path)
+        if overlay is not None:
+            frame = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+        else:
+            frame = np.ones((height, width, 3), dtype=np.uint8) * 255
+    else:
+        frame = np.ones((height, width, 3), dtype=np.uint8) * 255
+
+    ones = np.ones((points.shape[0], 1), dtype=np.float32)
+    pts_h = np.concatenate([points.astype(np.float32), ones], axis=1)
+    cam = pts_h @ w2c.T
+    z = cam[:, 2]
+    valid = z > 1e-6
+    if not np.any(valid):
+        return frame
+
+    cam = cam[valid]
+    draw_colors = colors[valid]
+    z = z[valid]
+
+    u = intrinsic[0, 0] * (cam[:, 0] / z) + intrinsic[0, 2]
+    v = intrinsic[1, 1] * (cam[:, 1] / z) + intrinsic[1, 2]
+
+    order = np.argsort(z)[::-1]
+    u = u[order]
+    v = v[order]
+    draw_colors = draw_colors[order]
+
+    for px, py, color in zip(u, v, draw_colors):
+        x = int(round(px))
+        y = int(round(py))
+        if 0 <= x < width and 0 <= y < height:
+            rgb = np.clip(color * 255.0, 0, 255).astype(np.uint8).tolist()
+            cv2.circle(frame, (x, y), point_radius, rgb, thickness=-1, lineType=cv2.LINE_AA)
+
+    return frame
 
 
 def visualize_pc(
@@ -18,12 +70,21 @@ def visualize_pc(
     save_video=False,
     save_path=None,
     vis_cam_idx=0,
+    width=None,
+    height=None,
+    intrinsic=None,
+    w2c=None,
+    overlay_path=None,
 ):
     # Deprecated function, use visualize_pc instead
     FPS = cfg.FPS
-    width, height = cfg.WH
-    intrinsic = cfg.intrinsics[vis_cam_idx]
-    w2c = cfg.w2cs[vis_cam_idx]
+    if width is None or height is None:
+        width, height = cfg.WH
+    if intrinsic is None:
+        intrinsic = cfg.intrinsics[vis_cam_idx]
+    if w2c is None:
+        w2c = cfg.w2cs[vis_cam_idx]
+    overlay_root = cfg.overlay_path if overlay_path is None else overlay_path
 
     # Convert the stuffs to numpy if it's tensor
     if isinstance(object_points, torch.Tensor):
@@ -60,8 +121,17 @@ def visualize_pc(
             )
 
     # The pcs is a 4d pcd numpy array with shape (n_frames, n_points, 3)
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(visible=visualize, width=width, height=height)
+    vis = None
+    use_headless_fallback = False
+    if visualize or save_video:
+        headless_env = not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY")
+        if headless_env and save_video and not visualize:
+            use_headless_fallback = True
+        else:
+            vis = o3d.visualization.Visualizer()
+            created = vis.create_window(visible=visualize, width=width, height=height)
+            if not created:
+                use_headless_fallback = True
 
     if save_video and visualize:
         raise ValueError("Cannot save video and visualize at the same time.")
@@ -71,7 +141,7 @@ def visualize_pc(
         fourcc = cv2.VideoWriter_fourcc(*"avc1")  # Codec for .mp4 file format
         video_writer = cv2.VideoWriter(save_path, fourcc, FPS, (width, height))
 
-    if controller_points is not None:
+    if controller_points is not None and not use_headless_fallback:
         controller_meshes = []
         prev_center = []
     for i in range(object_points.shape[0]):
@@ -86,6 +156,31 @@ def visualize_pc(
             object_pcd.colors = o3d.utility.Vector3dVector(
                 object_colors[i, np.where(object_visibilities[i])[0], :]
             )
+        if use_headless_fallback:
+            if object_visibilities is None:
+                frame_points = object_points[i]
+                frame_colors = object_colors[i]
+            else:
+                valid_idx = np.where(object_visibilities[i])[0]
+                frame_points = object_points[i, valid_idx, :]
+                frame_colors = object_colors[i, valid_idx, :]
+            frame = _render_frame_projected(
+                frame_points,
+                frame_colors,
+                intrinsic,
+                w2c,
+                width,
+                height,
+                overlay_path=f"{overlay_root}/{vis_cam_idx}" if overlay_root is not None else None,
+                frame_idx=i,
+            )
+            if save_video:
+                video_writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            if visualize:
+                cv2.imshow("visualize_pc", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                cv2.waitKey(max(1, int(1000 / FPS)))
+            continue
+
         if i == 0:
             render_object_pcd = object_pcd
             vis.add_geometry(render_object_pcd)
@@ -130,13 +225,14 @@ def visualize_pc(
         if save_video:
             frame = np.asarray(vis.capture_screen_float_buffer(do_render=True))
             frame = (frame * 255).astype(np.uint8)
-            if cfg.overlay_path is not None:
+            if overlay_root is not None:
                 # Get the mask where the pixel is white
                 mask = np.all(frame == [255, 255, 255], axis=-1)
-                image_path = f"{cfg.overlay_path}/{vis_cam_idx}/{i}.png"
+                image_path = f"{overlay_root}/{vis_cam_idx}/{i}.png"
                 overlay = cv2.imread(image_path)
-                overlay = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
-                frame[mask] = overlay[mask]
+                if overlay is not None:
+                    overlay = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+                    frame[mask] = overlay[mask]
             # Convert RGB to BGR
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             video_writer.write(frame)
@@ -144,6 +240,9 @@ def visualize_pc(
         if visualize:
             time.sleep(1 / FPS)
 
-    vis.destroy_window()
+    if vis is not None:
+        vis.destroy_window()
+    if use_headless_fallback and visualize:
+        cv2.destroyAllWindows()
     if save_video:
         video_writer.release()

@@ -1,5 +1,7 @@
 import torch
 import kornia
+import numpy as np
+from scipy.spatial import cKDTree
 
 
 def quat2mat(q):
@@ -228,19 +230,14 @@ def create_relation_matrix(points, K=5):
         torch.Tensor: NxN relation matrix with dtype int.
     """
     N = points.shape[0]
+    topk_indices = get_topk_indices(points, K=K)
 
-    # Compute pairwise squared Euclidean distances
-    dist_matrix = torch.cdist(points, points, p=2)  # (N, N)
-
-    # Get the indices of the top K closest neighbors (excluding self)
-    topk_indices = torch.topk(dist_matrix, K + 1, largest=False).indices[:, 1:]  # Skip self (0 distance)
-
-    # Create the NxN relation matrix
-    relation_matrix = torch.zeros((N, N), dtype=torch.int)
-
-    # Scatter 1s for the top K neighbors
-    batch_indices = torch.arange(N).unsqueeze(1).expand(-1, K)
-    relation_matrix[batch_indices, topk_indices] = 1
+    relation_matrix = torch.zeros((N, N), dtype=torch.int, device=points.device)
+    if topk_indices.numel() > 0:
+        batch_indices = torch.arange(
+            N, device=points.device, dtype=torch.long
+        ).unsqueeze(1).expand_as(topk_indices)
+        relation_matrix[batch_indices, topk_indices] = 1
 
     return relation_matrix
 
@@ -256,13 +253,25 @@ def get_topk_indices(points, K=5):
     Returns:
         torch.Tensor: Tensor of shape (N, K) containing the indices of the top K closest neighbors.
     """
-    # Compute pairwise squared Euclidean distances
-    dist_matrix = torch.cdist(points, points, p=2)  # (N, N)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"points must be [N,3], got {tuple(points.shape)}")
 
-    # Get the indices of the top K closest neighbors (excluding self)
-    topk_indices = torch.topk(dist_matrix, K + 1, largest=False).indices[:, 1:]  # Skip self (0 distance)
+    n_points = int(points.shape[0])
+    if n_points == 0:
+        return torch.zeros((0, 0), dtype=torch.long, device=points.device)
 
-    return topk_indices
+    k_eff = min(int(K), max(n_points - 1, 0))
+    if k_eff == 0:
+        return torch.zeros((n_points, 0), dtype=torch.long, device=points.device)
+
+    points_np = points.detach().cpu().numpy().astype(np.float32, copy=False)
+    tree = cKDTree(points_np)
+    _, indices = tree.query(points_np, k=k_eff + 1)
+    indices = np.asarray(indices)
+    if indices.ndim == 1:
+        indices = indices[:, None]
+    topk_indices = indices[:, 1 : k_eff + 1].astype(np.int64, copy=False)
+    return torch.from_numpy(topk_indices).to(points.device)
 
 
 def knn_weights(bones, pts, K=5):

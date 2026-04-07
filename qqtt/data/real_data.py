@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 import pickle
@@ -71,6 +72,22 @@ class RealData:
         self.controller_points = torch.tensor(
             controller_points, dtype=torch.float32, device=cfg.device
         )
+
+        # Optional: DINO node cluster mask for per-cluster topology + edge gating
+        self.init_masks = None
+        case_name = os.path.basename(os.path.dirname(self.data_path))
+        sem_cache = getattr(cfg, "sem_cache_dir", "semantic/cache")
+        cluster_path = os.path.join(sem_cache, f"{case_name}_node_cluster.npy")
+        if os.path.isfile(cluster_path):
+            node_cluster = np.load(cluster_path)
+            if node_cluster.size == self.structure_points.shape[0]:
+                self.init_masks = torch.tensor(
+                    node_cluster, dtype=torch.long, device=cfg.device
+                )
+                logger.info(
+                    f"[DATA]: loaded DINO cluster mask from {cluster_path} "
+                    f"(K={int(node_cluster.max()) + 1})"
+                )
 
         self.frame_len = self.object_points.shape[0]
         # Visualize/save the GT frames

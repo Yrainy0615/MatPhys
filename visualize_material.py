@@ -44,6 +44,10 @@ if __name__ == "__main__":
         default="./experiments",
     )
     parser.add_argument("--case_name", type=str, default="double_stretch_sloth")
+    parser.add_argument("--model_path", type=str, default=None, help="Path to the best model checkpoint. If not provided, searches in experiments/{case_name}/train/")
+    parser.add_argument("--use_knn_topology", type=str, default=None, help="Override use_knn_topology config (true/false)")
+    parser.add_argument("--object_knn", type=int, default=None, help="Override object_knn config")
+    parser.add_argument("--use_edge_gating", type=str, default=None, help="Override use_edge_gating config (true/false)")
     args = parser.parse_args()
 
     base_path = args.base_path
@@ -78,6 +82,37 @@ if __name__ == "__main__":
     cfg.WH = data["WH"]
     cfg.overlay_path = f"{base_path}/{case_name}/color"
 
+    # Auto-detect config from checkpoint before building the simulator
+    if args.model_path:
+        best_model_path = args.model_path
+    else:
+        candidates = glob.glob(f"experiments/{case_name}/train/best_*.pth")
+        assert candidates, f"No best model found in experiments/{case_name}/train/"
+        best_model_path = candidates[0]
+
+    # Detect whether the checkpoint was trained with edge gating
+    checkpoint_keys = torch.load(best_model_path, map_location="cpu").keys()
+    has_edge_gate = "edge_gate" in checkpoint_keys and "log_a" in checkpoint_keys
+
+    # Override config to match the checkpoint
+    if args.use_knn_topology is not None:
+        cfg.use_knn_topology = args.use_knn_topology.lower() == "true"
+    if args.object_knn is not None:
+        cfg.object_knn = args.object_knn
+    if args.use_edge_gating is not None:
+        cfg.use_edge_gating = args.use_edge_gating.lower() == "true"
+    elif not has_edge_gate:
+        # Auto-disable edge gating if checkpoint doesn't have it
+        logger.info("Checkpoint has no edge_gate/log_a keys; disabling use_edge_gating")
+        cfg.use_edge_gating = False
+        if args.use_knn_topology is None:
+            # If checkpoint was trained without edge gating, it likely used radius-based topology
+            logger.info("Disabling use_knn_topology to match old checkpoint")
+            cfg.use_knn_topology = False
+        # Also disable DINO cluster mask loading since old models didn't use it
+        logger.info("Disabling DINO cluster mask to match old checkpoint")
+        cfg.sem_cache_dir = "__disabled__"
+
     exp_name = "init=hybrid_iso=True_ldepth=0.001_lnormal=0.0_laniso_0.0_lseg=1.0"
     gaussians_path = f"{args.gaussian_path}/{case_name}/{exp_name}/point_cloud/iteration_10000/point_cloud.ply"
 
@@ -88,5 +123,4 @@ if __name__ == "__main__":
         pure_inference_mode=True,
     )
 
-    best_model_path = glob.glob(f"experiments/{case_name}/train/best_*.pth")[0]
     trainer.visualize_material(best_model_path, gaussians_path)

@@ -13,10 +13,11 @@ import warp as wp
 from scipy.spatial import KDTree
 import pickle
 import cv2
-from pynput import keyboard
 import pyrender
 import trimesh
 import matplotlib.pyplot as plt
+import json
+from datetime import datetime
 
 from gaussian_splatting.scene.gaussian_model import GaussianModel
 from gaussian_splatting.scene.cameras import Camera
@@ -40,6 +41,11 @@ import copy
 import time
 import threading
 import time
+
+try:
+    from pynput import keyboard
+except Exception:
+    keyboard = None
 
 
 class InvPhyTrainerWarp:
@@ -74,6 +80,11 @@ class InvPhyTrainerWarp:
             self.num_original_points = self.dataset.num_original_points
             self.num_surface_points = self.dataset.num_surface_points
             self.num_all_points = self.dataset.num_all_points
+            # Per-cluster topology: use DINO node cluster mask if present (for edge gating)
+            if self.init_masks is None and getattr(
+                self.dataset, "init_masks", None
+            ) is not None:
+                self.init_masks = self.dataset.init_masks
         elif cfg.data_type == "synthetic":
             self.dataset = SimpleData(visualize=False)
             self.object_points = self.dataset.data
@@ -121,9 +132,15 @@ class InvPhyTrainerWarp:
             use_knn_topology=getattr(cfg, "use_knn_topology", False),
             object_knn=getattr(cfg, "object_knn", 20),
             controller_knn=getattr(cfg, "controller_knn", 30),
+            explicit_topology_path=getattr(cfg, "explicit_topology_path", None),
         )
 
         use_edge_gating = getattr(cfg, "use_edge_gating", False)
+        # DINO cluster masks are only used for per-cluster topology in _init_start.
+        # Do NOT pass them to the simulator as init_masks — that would wrongly
+        # enable inter-cluster collision detection.  Only pass init_masks when
+        # they represent truly separate collision objects (e.g. synthetic scenes).
+        sim_masks = None if use_edge_gating else self.init_masks
         self.simulator = SpringMassSystemWarp(
             self.init_vertices,
             self.init_springs,
@@ -138,7 +155,7 @@ class InvPhyTrainerWarp:
             drag_damping=cfg.drag_damping,
             collide_object_elas=cfg.collide_object_elas,
             collide_object_fric=cfg.collide_object_fric,
-            init_masks=self.init_masks,
+            init_masks=sim_masks,
             collision_dist=cfg.collision_dist,
             init_velocities=self.init_velocities,
             num_object_points=self.num_all_points,
@@ -209,10 +226,72 @@ class InvPhyTrainerWarp:
         use_knn_topology=False,
         object_knn=20,
         controller_knn=30,
+        explicit_topology_path=None,
     ):
         object_points = object_points.cpu().numpy()
         if controller_points is not None:
             controller_points = controller_points.cpu().numpy()
+        if explicit_topology_path:
+            checkpoint = torch.load(
+                explicit_topology_path, map_location="cpu", weights_only=True
+            )
+            explicit_edges = checkpoint.get("edges", None)
+            if explicit_edges is not None:
+                if isinstance(explicit_edges, torch.Tensor):
+                    explicit_edges = explicit_edges.detach().cpu().numpy()
+                explicit_edges = np.asarray(explicit_edges, dtype=np.int64)
+                if explicit_edges.ndim != 2 or explicit_edges.shape[1] != 2:
+                    raise ValueError(
+                        f"Explicit topology at {explicit_topology_path} must store edges as [E,2], "
+                        f"got {explicit_edges.shape}"
+                    )
+                if explicit_edges.size > 0:
+                    if explicit_edges.min() < 0 or explicit_edges.max() >= len(object_points):
+                        raise ValueError(
+                            f"Explicit topology at {explicit_topology_path} has node indices outside "
+                            f"[0, {len(object_points) - 1}]"
+                        )
+                points = object_points
+                springs = explicit_edges.tolist()
+                rest_lengths = [
+                    np.linalg.norm(points[i] - points[j]) for i, j in explicit_edges
+                ]
+                num_object_springs = len(springs)
+
+                if controller_points is not None:
+                    object_pcd = o3d.geometry.PointCloud()
+                    object_pcd.points = o3d.utility.Vector3dVector(points)
+                    pcd_tree = o3d.geometry.KDTreeFlann(object_pcd)
+                    num_object_points = len(points)
+                    points = np.concatenate([points, controller_points], axis=0)
+                    for i in range(len(controller_points)):
+                        if use_knn_topology:
+                            [k, idx, _] = pcd_tree.search_knn_vector_3d(
+                                controller_points[i],
+                                min(controller_knn, num_object_points),
+                            )
+                        else:
+                            [k, idx, _] = pcd_tree.search_hybrid_vector_3d(
+                                controller_points[i],
+                                controller_radius,
+                                controller_max_neighbours,
+                            )
+                        for j in idx:
+                            springs.append([num_object_points + i, j])
+                            rest_lengths.append(
+                                np.linalg.norm(controller_points[i] - points[j])
+                            )
+
+                springs = np.asarray(springs, dtype=np.int32)
+                rest_lengths = np.asarray(rest_lengths, dtype=np.float32)
+                masses = np.ones(len(points), dtype=np.float32)
+                return (
+                    torch.tensor(points, dtype=torch.float32, device=cfg.device),
+                    torch.tensor(springs, dtype=torch.int32, device=cfg.device),
+                    torch.tensor(rest_lengths, dtype=torch.float32, device=cfg.device),
+                    torch.tensor(masses, dtype=torch.float32, device=cfg.device),
+                    num_object_springs,
+                )
         if mask is None:
             object_pcd = o3d.geometry.PointCloud()
             object_pcd.points = o3d.utility.Vector3dVector(object_points)
@@ -281,56 +360,78 @@ class InvPhyTrainerWarp:
             )
         else:
             mask = mask.cpu().numpy()
-            # Get the unique value in masks
             unique_values = np.unique(mask)
-            vertices = []
+            points = object_points  # keep original point order
+
+            # Build per-cluster spring topology (edges only within each cluster)
+            spring_flags = np.zeros((len(points), len(points)))
             springs = []
             rest_lengths = []
-            index = 0
-            # Loop different objects to connect the springs separately
             for value in unique_values:
-                temp_points = object_points[mask == value]
-                temp_pcd = o3d.geometry.PointCloud()
-                temp_pcd.points = o3d.utility.Vector3dVector(temp_points)
-                temp_tree = o3d.geometry.KDTreeFlann(temp_pcd)
-                temp_spring_flags = np.zeros((len(temp_points), len(temp_points)))
-                temp_springs = []
-                temp_rest_lengths = []
-                for i in range(len(temp_points)):
+                cluster_indices = np.where(mask == value)[0]
+                cluster_points = points[cluster_indices]
+                cluster_pcd = o3d.geometry.PointCloud()
+                cluster_pcd.points = o3d.utility.Vector3dVector(cluster_points)
+                cluster_tree = o3d.geometry.KDTreeFlann(cluster_pcd)
+                # Cap KNN by cluster size to avoid over-connectivity in small clusters
+                effective_knn = min(object_knn, len(cluster_points) - 1)
+                for li in range(len(cluster_points)):
+                    gi = cluster_indices[li]  # global index
                     if use_knn_topology:
-                        [k, idx, _] = temp_tree.search_knn_vector_3d(
-                            temp_points[i], object_knn + 1
+                        [k, idx, _] = cluster_tree.search_knn_vector_3d(
+                            cluster_points[li], effective_knn + 1
                         )
                     else:
-                        [k, idx, _] = temp_tree.search_hybrid_vector_3d(
-                            temp_points[i], object_radius, object_max_neighbours
+                        [k, idx, _] = cluster_tree.search_hybrid_vector_3d(
+                            cluster_points[li], object_radius, object_max_neighbours
                         )
                     idx = idx[1:]
-                    for j in idx:
-                        rest_length = np.linalg.norm(temp_points[i] - temp_points[j])
+                    for lj in idx:
+                        gj = cluster_indices[lj]  # global index
+                        rest_length = np.linalg.norm(points[gi] - points[gj])
                         if (
-                            temp_spring_flags[i, j] == 0
-                            and temp_spring_flags[j, i] == 0
+                            spring_flags[gi, gj] == 0
+                            and spring_flags[gj, gi] == 0
                             and rest_length > 1e-4
                         ):
-                            temp_spring_flags[i, j] = 1
-                            temp_spring_flags[j, i] = 1
-                            temp_springs.append([i + index, j + index])
-                            temp_rest_lengths.append(rest_length)
-                vertices += temp_points.tolist()
-                springs += temp_springs
-                rest_lengths += temp_rest_lengths
-                index += len(temp_points)
+                            spring_flags[gi, gj] = 1
+                            spring_flags[gj, gi] = 1
+                            springs.append([gi, gj])
+                            rest_lengths.append(rest_length)
 
             num_object_springs = len(springs)
 
-            vertices = np.array(vertices)
+            # Add controller point springs (same as the no-mask branch)
+            if controller_points is not None:
+                object_pcd = o3d.geometry.PointCloud()
+                object_pcd.points = o3d.utility.Vector3dVector(points)
+                pcd_tree = o3d.geometry.KDTreeFlann(object_pcd)
+                num_object_points = len(points)
+                points = np.concatenate([points, controller_points], axis=0)
+                for i in range(len(controller_points)):
+                    if use_knn_topology:
+                        [k, idx, _] = pcd_tree.search_knn_vector_3d(
+                            controller_points[i],
+                            min(controller_knn, num_object_points),
+                        )
+                    else:
+                        [k, idx, _] = pcd_tree.search_hybrid_vector_3d(
+                            controller_points[i],
+                            controller_radius,
+                            controller_max_neighbours,
+                        )
+                    for j in idx:
+                        springs.append([num_object_points + i, j])
+                        rest_lengths.append(
+                            np.linalg.norm(controller_points[i] - points[j])
+                        )
+
             springs = np.array(springs)
             rest_lengths = np.array(rest_lengths)
-            masses = np.ones(len(vertices))
+            masses = np.ones(len(points))
 
             return (
-                torch.tensor(vertices, dtype=torch.float32, device=cfg.device),
+                torch.tensor(points, dtype=torch.float32, device=cfg.device),
                 torch.tensor(springs, dtype=torch.int32, device=cfg.device),
                 torch.tensor(rest_lengths, dtype=torch.float32, device=cfg.device),
                 torch.tensor(masses, dtype=torch.float32, device=cfg.device),
@@ -502,7 +603,9 @@ class InvPhyTrainerWarp:
         if model_path is not None:
             # Load the model
             logger.info(f"Load model from {model_path}")
-            checkpoint = torch.load(model_path, map_location=cfg.device)
+            checkpoint = torch.load(
+                model_path, map_location=cfg.device, weights_only=True
+            )
 
             spring_Y = checkpoint["spring_Y"]
             collide_elas = checkpoint["collide_elas"]
@@ -982,12 +1085,458 @@ class InvPhyTrainerWarp:
         min_idx = min_indices[torch.argmin(min_dist_per_ctrl_pts)]
         return self.structure_points[min_idx].unsqueeze(0)
 
+    def _project_world_points(self, points, intrinsic, w2c, width=None, height=None):
+        ones = np.ones((points.shape[0], 1), dtype=np.float32)
+        homo = np.concatenate([points, ones], axis=1)
+        cam = (w2c @ homo.T).T[:, :3]
+        valid = cam[:, 2] > 1e-6
+        pixels = np.full((points.shape[0], 2), np.nan, dtype=np.float32)
+        if np.any(valid):
+            proj = (intrinsic @ cam[valid].T).T
+            uv = proj[:, :2] / proj[:, 2:3]
+            if width is not None and height is not None and np.max(np.abs(intrinsic[:2, :])) <= 2.0:
+                uv[:, 0] *= float(width)
+                uv[:, 1] *= float(height)
+            pixels[valid] = uv
+        return pixels, cam[:, 2], valid
+
+    def _screen_to_world_at_cam_depth(self, pixel, cam_depth, intrinsic, w2c, width=None, height=None):
+        fx = intrinsic[0, 0]
+        fy = intrinsic[1, 1]
+        cx = intrinsic[0, 2]
+        cy = intrinsic[1, 2]
+        px = float(pixel[0])
+        py = float(pixel[1])
+        if width is not None and height is not None and np.max(np.abs(intrinsic[:2, :])) <= 2.0:
+            px /= float(width)
+            py /= float(height)
+        cam_point = np.array(
+            [
+                (px - cx) * cam_depth / fx,
+                (py - cy) * cam_depth / fy,
+                cam_depth,
+                1.0,
+            ],
+            dtype=np.float32,
+        )
+        c2w = np.linalg.inv(w2c)
+        world_point = c2w @ cam_point
+        return world_point[:3]
+
+    def object_point_drag_playground(
+        self,
+        model_path,
+        gs_path,
+        pick_radius_px=30.0,
+        pose_json_path=None,
+        method="controller",
+    ):
+        logger.info(f"Load model from {model_path}")
+        checkpoint = torch.load(
+            model_path, map_location=cfg.device, weights_only=True
+        )
+
+        spring_Y = checkpoint["spring_Y"]
+        collide_elas = checkpoint["collide_elas"]
+        collide_fric = checkpoint["collide_fric"]
+        collide_object_elas = checkpoint["collide_object_elas"]
+        collide_object_fric = checkpoint["collide_object_fric"]
+        collision_dist = checkpoint.get("collision_dist", None)
+        dashpot_damping = checkpoint.get("dashpot_damping", None)
+        drag_damping = checkpoint.get("drag_damping", None)
+
+        assert (
+            len(spring_Y) == self.simulator.n_springs
+        ), "Check if the loaded checkpoint match the config file to connect the springs"
+
+        if (
+            "edge_gate" in checkpoint
+            and "log_a" in checkpoint
+            and self.simulator.wp_edge_gate is not None
+        ):
+            self.simulator.set_edge_gate(
+                checkpoint["edge_gate"].detach().clone().to(cfg.device)
+            )
+            self.simulator.set_log_a(checkpoint["log_a"].detach().clone().to(cfg.device))
+        else:
+            self.simulator.set_spring_Y(torch.log(spring_Y).detach().clone())
+
+        self.simulator.set_collide(
+            collide_elas.detach().clone(), collide_fric.detach().clone()
+        )
+        self.simulator.set_collide_object(
+            collide_object_elas.detach().clone(),
+            collide_object_fric.detach().clone(),
+        )
+        if collision_dist is not None:
+            self.simulator.collision_dist = float(collision_dist.view(-1)[0].item())
+        if dashpot_damping is not None:
+            self.simulator.dashpot_damping = float(dashpot_damping.view(-1)[0].item())
+        if drag_damping is not None:
+            self.simulator.drag_damping = float(drag_damping.view(-1)[0].item())
+        # Temporary mouse controller is not part of the checkpointed physics.
+        # Tune it to be movable without exploding the object.
+        median_k = float(torch.median(spring_Y).item())
+        temp_controller_k = max(median_k * 0.5, 200.0)
+        temp_controller_damping = max(float(self.simulator.drag_damping) * 0.02, 0.05)
+        self.simulator.set_init_state(
+            self.simulator.wp_init_vertices, self.simulator.wp_init_velocities
+        )
+
+        vis_cam_idx = 0
+        width, height = cfg.WH
+        intrinsic = cfg.intrinsics[vis_cam_idx]
+        w2c = cfg.w2cs[vis_cam_idx]
+        if pose_json_path is None:
+            inferred_pose_json = os.path.join(os.path.dirname(gs_path), "pose.json")
+            if os.path.isfile(inferred_pose_json):
+                pose_json_path = inferred_pose_json
+        if pose_json_path is not None and os.path.isfile(pose_json_path):
+            with open(pose_json_path, "r") as f:
+                pose = json.load(f)
+            if "pose" in pose:
+                pose = pose["pose"][0]
+            w2c = np.array(pose["extrinsic"], dtype=np.float32)
+            intrinsic = np.array(pose["intrinsic"], dtype=np.float32)
+            intrinsic[0, :] *= float(width)
+            intrinsic[1, :] *= float(height)
+
+        if self.simulator.controller_points is not None:
+            current_target = self.simulator.controller_points[0].clone()
+            prev_target = current_target.clone()
+        else:
+            current_target = None
+            prev_target = None
+
+        gaussians = GaussianModel(sh_degree=3)
+        gaussians.load_ply(gs_path)
+        gaussians = remove_gaussians_with_low_opacity(gaussians, 0.1)
+        self._set_gaussian_scaling_mode(gaussians)
+        current_pos = gaussians.get_xyz
+        current_rot = gaussians.get_rotation
+        background = torch.tensor([1, 1, 1], dtype=torch.float32, device=cfg.device)
+        view = self._create_gs_view(w2c, intrinsic, height, width)
+
+        overlay = cv2.imread(cfg.bg_img_path)
+        overlay = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+        if overlay.shape[1] != width or overlay.shape[0] != height:
+            overlay = cv2.resize(overlay, (width, height), interpolation=cv2.INTER_LINEAR)
+        overlay = torch.tensor(overlay, dtype=torch.float32, device=cfg.device)
+        video_writer = None
+        recording = False
+        record_fps = max(int(cfg.FPS), 1)
+
+        relations = None
+        weights = None
+        weights_indices = None
+        prev_x = None
+        current_x = wp.to_torch(
+            self.simulator.wp_states[0].wp_x, requires_grad=False
+        ).clone()
+
+        drag_state = {
+            "selected_idx": None,
+            "selected_depth": None,
+            "dragging": False,
+            "prev_target": None,
+            "current_target": None,
+            "projected_pixel": None,
+            "release_frames": 0,
+            "release_start": None,
+            "just_selected": False,
+        }
+
+        def mouse_callback(event, x, y, flags, param):
+            if event == cv2.EVENT_RBUTTONDOWN:
+                drag_state["selected_idx"] = None
+                drag_state["selected_depth"] = None
+                drag_state["dragging"] = False
+                drag_state["prev_target"] = None
+                drag_state["current_target"] = None
+                drag_state["projected_pixel"] = None
+                drag_state["release_frames"] = 0
+                drag_state["release_start"] = None
+                drag_state["just_selected"] = False
+                if method == "controller":
+                    self.simulator.clear_temp_controller_interactive()
+                else:
+                    self.simulator.clear_picked_object_interactive()
+                return
+
+            if current_x is None:
+                return
+
+            points = current_x.detach().cpu().numpy()
+            pixels, depths, valid = self._project_world_points(
+                points, intrinsic, w2c, width=width, height=height
+            )
+
+            if event == cv2.EVENT_LBUTTONDBLCLK:
+                if not np.any(valid):
+                    return
+                deltas = pixels - np.array([x, y], dtype=np.float32)
+                dists = np.linalg.norm(deltas, axis=1)
+                dists[~valid] = np.inf
+                pick_idx = int(np.argmin(dists))
+                if not np.isfinite(dists[pick_idx]) or dists[pick_idx] > pick_radius_px:
+                    return
+
+                drag_state["selected_idx"] = pick_idx
+                drag_state["selected_depth"] = float(depths[pick_idx])
+                world_point = points[pick_idx].copy()
+                drag_state["prev_target"] = world_point.copy()
+                drag_state["current_target"] = world_point.copy()
+                drag_state["projected_pixel"] = pixels[pick_idx].copy()
+                drag_state["just_selected"] = True
+                return
+
+            if drag_state["selected_idx"] is None:
+                return
+
+            selected_pixel = pixels[drag_state["selected_idx"]]
+            if np.all(np.isfinite(selected_pixel)):
+                drag_state["projected_pixel"] = selected_pixel.copy()
+
+            if event == cv2.EVENT_LBUTTONDOWN:
+                if drag_state["just_selected"]:
+                    return
+                if (
+                    drag_state["projected_pixel"] is not None
+                    and np.linalg.norm(
+                        drag_state["projected_pixel"] - np.array([x, y], dtype=np.float32)
+                    )
+                    <= pick_radius_px
+                ):
+                    drag_state["dragging"] = True
+
+            if event == cv2.EVENT_MOUSEMOVE and drag_state["dragging"]:
+                target = self._screen_to_world_at_cam_depth(
+                    np.array([x, y], dtype=np.float32),
+                    drag_state["selected_depth"],
+                    intrinsic,
+                    w2c,
+                    width=width,
+                    height=height,
+                )
+                drag_state["current_target"] = target
+
+            if event == cv2.EVENT_LBUTTONUP:
+                drag_state["dragging"] = False
+                if drag_state["just_selected"]:
+                    drag_state["just_selected"] = False
+                    return
+                if drag_state["current_target"] is not None:
+                    drag_state["release_start"] = drag_state["current_target"].copy()
+                    drag_state["release_frames"] = 8
+
+        window_name = "Object Point Drag Playground"
+        cv2.namedWindow(window_name)
+        cv2.setMouseCallback(window_name, mouse_callback)
+
+        while True:
+            should_step = drag_state["dragging"] or drag_state["release_frames"] > 0
+
+            if (
+                not drag_state["dragging"]
+                and drag_state["release_frames"] > 0
+                and drag_state["selected_idx"] is not None
+                and drag_state["release_start"] is not None
+            ):
+                alpha = float(drag_state["release_frames"] - 1) / 8.0
+                selected_world = current_x[drag_state["selected_idx"]].detach().cpu().numpy()
+                drag_state["prev_target"] = drag_state["current_target"].copy()
+                drag_state["current_target"] = (
+                    alpha * drag_state["release_start"] + (1.0 - alpha) * selected_world
+                ).astype(np.float32)
+                drag_state["release_frames"] -= 1
+                if drag_state["release_frames"] == 0:
+                    drag_state["prev_target"] = None
+                    drag_state["current_target"] = None
+                    drag_state["release_start"] = None
+
+            if current_target is not None:
+                self.simulator.set_controller_interactive(prev_target, current_target)
+
+            if (
+                drag_state["selected_idx"] is not None
+                and (drag_state["dragging"] or drag_state["release_frames"] > 0)
+                and drag_state["prev_target"] is not None
+                and drag_state["current_target"] is not None
+            ):
+                if method == "controller":
+                    self.simulator.set_temp_controller_interactive(
+                        drag_state["selected_idx"],
+                        drag_state["prev_target"],
+                        drag_state["current_target"],
+                        temp_controller_k,
+                        temp_controller_damping,
+                    )
+                else:
+                    self.simulator.set_picked_object_interactive(
+                        drag_state["selected_idx"],
+                        drag_state["prev_target"],
+                        drag_state["current_target"],
+                    )
+            else:
+                if method == "controller":
+                    self.simulator.clear_temp_controller_interactive()
+                else:
+                    self.simulator.clear_picked_object_interactive()
+
+            if self.simulator.object_collision_flag:
+                self.simulator.update_collision_graph()
+
+            if should_step:
+                wp.capture_launch(self.simulator.forward_graph)
+                x = wp.to_torch(self.simulator.wp_states[-1].wp_x, requires_grad=False)
+                self.simulator.set_init_state(
+                    self.simulator.wp_states[-1].wp_x,
+                    self.simulator.wp_states[-1].wp_v,
+                )
+            else:
+                x = current_x
+
+            frame = overlay.clone()
+            results = render_gaussian(view, gaussians, None, background)
+            rendering = results["render"]
+
+            image = rendering.permute(1, 2, 0).detach().clamp(0, 1)
+            image_mask = image[:, :, 3] > 100 / 255
+            image[..., 3].masked_fill_(~image_mask, 0.0)
+            alpha = image[..., 3:4]
+            rgb = image[..., :3] * 255
+            frame = alpha * rgb + (1 - alpha) * frame
+            frame = frame.cpu().numpy().astype(np.uint8)
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+            if drag_state["selected_idx"] is not None:
+                selected_world = x[drag_state["selected_idx"]].detach().cpu().numpy()
+                selected_pixel, _, valid = self._project_world_points(
+                    selected_world[None, :], intrinsic, w2c, width=width, height=height
+                )
+                if valid[0]:
+                    px, py = selected_pixel[0]
+                    cv2.circle(
+                        frame,
+                        (int(round(px)), int(round(py))),
+                        8,
+                        (0, 0, 255),
+                        2,
+                    )
+                    cv2.putText(
+                        frame,
+                        "picked",
+                        (int(round(px)) + 10, int(round(py)) - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 0, 255),
+                        2,
+                    )
+
+            cv2.putText(
+                frame,
+                "Double click: pick point | Drag: move | Right click: clear | S: record | ESC: quit",
+                (20, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 0),
+                2,
+            )
+            if recording:
+                cv2.putText(
+                    frame,
+                    "REC",
+                    (20, 65),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9,
+                    (0, 0, 255),
+                    3,
+                )
+
+            cv2.imshow(window_name, frame)
+            key = cv2.waitKey(1)
+            if key == 27:
+                break
+            if key in (ord("s"), ord("S")):
+                if recording:
+                    recording = False
+                    if video_writer is not None:
+                        video_writer.release()
+                        video_writer = None
+                else:
+                    os.makedirs(cfg.base_dir, exist_ok=True)
+                    video_path = os.path.join(
+                        cfg.base_dir,
+                        f"drag_recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4",
+                    )
+                    video_writer = cv2.VideoWriter(
+                        video_path,
+                        cv2.VideoWriter_fourcc(*"mp4v"),
+                        record_fps,
+                        (width, height),
+                    )
+                    recording = video_writer.isOpened()
+
+            if prev_x is not None:
+                with torch.no_grad():
+                    prev_particle_pos = prev_x
+                    cur_particle_pos = x
+
+                    if relations is None:
+                        relations = get_topk_indices(prev_x, K=16)
+                    if weights is None:
+                        weights, weights_indices = knn_weights_sparse(
+                            prev_particle_pos, current_pos, K=16
+                        )
+
+                    weights = calc_weights_vals_from_indices(
+                        prev_particle_pos, current_pos, weights_indices
+                    )
+                    current_pos, current_rot, _ = interpolate_motions_speedup(
+                        bones=prev_particle_pos,
+                        motions=cur_particle_pos - prev_particle_pos,
+                        relations=relations,
+                        weights=weights,
+                        weights_indices=weights_indices,
+                        xyz=current_pos,
+                        quat=current_rot,
+                    )
+                    gaussians._xyz = current_pos
+                    gaussians._rotation = current_rot
+
+            if should_step:
+                prev_x = x.clone()
+            current_x = x.clone()
+
+            if current_target is not None:
+                prev_target = current_target.clone()
+
+            if (
+                drag_state["selected_idx"] is not None
+                and drag_state["current_target"] is not None
+            ):
+                drag_state["prev_target"] = drag_state["current_target"].copy()
+
+            if recording and video_writer is not None:
+                video_writer.write(frame)
+
+        if video_writer is not None:
+            video_writer.release()
+        cv2.destroyWindow(window_name)
+
     def interactive_playground(
         self, model_path, gs_path, n_ctrl_parts=1, inv_ctrl=False, virtual_key_input=False
     ):
+        if keyboard is None:
+            raise ImportError(
+                "interactive_playground requires an X server because pynput is unavailable "
+                "in the current environment."
+            )
         # Load the model
         logger.info(f"Load model from {model_path}")
-        checkpoint = torch.load(model_path, map_location=cfg.device)
+        checkpoint = torch.load(
+            model_path, map_location=cfg.device, weights_only=True
+        )
 
         spring_Y = checkpoint["spring_Y"]
         collide_elas = checkpoint["collide_elas"]
@@ -995,6 +1544,9 @@ class InvPhyTrainerWarp:
         collide_object_elas = checkpoint["collide_object_elas"]
         collide_object_fric = checkpoint["collide_object_fric"]
         num_object_springs = checkpoint["num_object_springs"]
+        collision_dist = checkpoint.get("collision_dist", None)
+        dashpot_damping = checkpoint.get("dashpot_damping", None)
+        drag_damping = checkpoint.get("drag_damping", None)
 
         assert (
             len(spring_Y) == self.simulator.n_springs
@@ -1012,6 +1564,12 @@ class InvPhyTrainerWarp:
             collide_object_elas.detach().clone(),
             collide_object_fric.detach().clone(),
         )
+        if collision_dist is not None:
+            self.simulator.collision_dist = float(collision_dist.view(-1)[0].item())
+        if dashpot_damping is not None:
+            self.simulator.dashpot_damping = float(dashpot_damping.view(-1)[0].item())
+        if drag_damping is not None:
+            self.simulator.drag_damping = float(drag_damping.view(-1)[0].item())
 
         ###########################################################################
 
@@ -1037,7 +1595,7 @@ class InvPhyTrainerWarp:
         gaussians = GaussianModel(sh_degree=3)
         gaussians.load_ply(gs_path)
         gaussians = remove_gaussians_with_low_opacity(gaussians, 0.1)
-        gaussians.isotropic = True
+        self._set_gaussian_scaling_mode(gaussians)
         current_pos = gaussians.get_xyz
         current_rot = gaussians.get_rotation
         use_white_background = True  # set to True for white background
@@ -1484,10 +2042,16 @@ class InvPhyTrainerWarp:
         )
         return view
 
+    def _set_gaussian_scaling_mode(self, gaussians):
+        # Some stored PLYs use a single isotropic scale instead of per-axis scales.
+        gaussians.isotropic = gaussians._scaling.shape[1] == 1
+
     def visualize_force(self, model_path, gs_path, n_ctrl_parts=2, force_scale=30000):
         # Load the model
         logger.info(f"Load model from {model_path}")
-        checkpoint = torch.load(model_path, map_location=cfg.device)
+        checkpoint = torch.load(
+            model_path, map_location=cfg.device, weights_only=True
+        )
 
         spring_Y = checkpoint["spring_Y"]
         collide_elas = checkpoint["collide_elas"]
@@ -1524,7 +2088,7 @@ class InvPhyTrainerWarp:
         gaussians = GaussianModel(sh_degree=3)
         gaussians.load_ply(gs_path)
         gaussians = remove_gaussians_with_low_opacity(gaussians, 0.1)
-        gaussians.isotropic = True
+        self._set_gaussian_scaling_mode(gaussians)
         current_pos = gaussians.get_xyz
         current_rot = gaussians.get_rotation
         use_white_background = True  # set to True for white background
@@ -1833,7 +2397,9 @@ class InvPhyTrainerWarp:
     def visualize_material(self, model_path, gs_path, relative_material=True):
         # Load the model
         logger.info(f"Load model from {model_path}")
-        checkpoint = torch.load(model_path, map_location=cfg.device)
+        checkpoint = torch.load(
+            model_path, map_location=cfg.device, weights_only=True
+        )
 
         spring_Y = checkpoint["spring_Y"]
         collide_elas = checkpoint["collide_elas"]
@@ -1870,7 +2436,7 @@ class InvPhyTrainerWarp:
         gaussians = GaussianModel(sh_degree=3)
         gaussians.load_ply(gs_path)
         gaussians = remove_gaussians_with_low_opacity(gaussians, 0.1)
-        gaussians.isotropic = True
+        self._set_gaussian_scaling_mode(gaussians)
         current_pos = gaussians.get_xyz
         current_rot = gaussians.get_rotation
         use_white_background = True  # set to True for white background

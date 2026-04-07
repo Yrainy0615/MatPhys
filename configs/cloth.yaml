@@ -28,9 +28,9 @@ chamfer_weight: 1.0
 track_weight: 1.0
 self_collision: true
 # KNN + edge gating (end-to-end topology learning)
-use_knn_topology: false
-object_knn: 20
-controller_knn: 30
+use_knn_topology: true
+object_knn: 400
+controller_knn: 300
 use_edge_gating: false
 k_base_from_rest_length: true
 edge_gate_init: 3.0
