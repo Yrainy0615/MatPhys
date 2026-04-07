@@ -15,8 +15,7 @@ SHELL ["/bin/bash", "-lc"]
 
 RUN ln -sf /usr/share/zoneinfo/Asia/Tokyo /etc/localtime && \
     groupadd -g "${GROUP_ID}" "${USER_NAME}" && \
-    useradd -u "${USER_ID}" -m "${USER_NAME}" -g "${USER_NAME}" && \
-    echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+    useradd -u "${USER_ID}" -m "${USER_NAME}" -g "${USER_NAME}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
@@ -63,6 +62,9 @@ RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-py310_25.1.1-2-Linux-
     conda config --system --set auto_update_conda false && \
     conda create -y -n phystwin python=3.10.19 pip && \
     conda clean -afy
+
+RUN echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USER_NAME} && \
+    chmod 0440 /etc/sudoers.d/${USER_NAME}
 
 WORKDIR /tmp/build/Phys-GS
 
