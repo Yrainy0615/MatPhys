@@ -1,59 +1,90 @@
-# Start with the NVIDIA CUDA base image
 FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
 
-# Set environment variables
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PATH="/opt/conda/bin:$PATH"
+ARG USER_ID=1130
+ARG GROUP_ID=300
+ARG USER_NAME="yyang"
 
-# Install system dependencies
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CONDA_DIR=/opt/conda
+ENV PATH=/opt/conda/bin:$PATH
+ENV TORCH_CUDA_ARCH_LIST=8.6+PTX
+ENV FORCE_CUDA=1
+ENV PIP_NO_CACHE_DIR=1
+
+SHELL ["/bin/bash", "-lc"]
+
+RUN ln -sf /usr/share/zoneinfo/Asia/Tokyo /etc/localtime && \
+    groupadd -g "${GROUP_ID}" "${USER_NAME}" && \
+    useradd -u "${USER_ID}" -m "${USER_NAME}" -g "${USER_NAME}" && \
+    echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget \
-    git \
+    bash \
     build-essential \
+    ca-certificates \
     cmake \
-    libgl1-mesa-glx \
+    curl \
+    ffmpeg \
     freeglut3-dev \
+    git \
+    libassimp-dev \
+    libavcodec-dev \
+    libavdevice-dev \
+    libboost-all-dev \
+    libegl1 \
+    libeigen3-dev \
+    libembree-dev \
+    libgl1 \
+    libgl1-mesa-dev \
+    libglew-dev \
     libglib2.0-0 \
-    libxcb-util1 \
-    libxcb-xinerama0 \
-    libxcb-icccm4 \
-    libxcb-image0 \
-    libxcb-keysyms1 \
-    libxcb-render-util0 \
+    libglu1-mesa-dev \
+    libglfw3-dev \
+    libgtk-3-dev \
+    libopencv-dev \
+    libsm6 \
+    libx11-6 \
+    libxext6 \
+    libxfixes3 \
+    libxinerama1 \
     libxkbcommon-x11-0 \
-    libgl1-mesa-glx \
+    libxrandr2 \
+    libxxf86vm-dev \
+    libxxf86vm1 \
+    pkg-config \
+    sudo \
+    vim \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Set environment variables for Qt
-ENV QT_DEBUG_PLUGINS=1
-ENV QT_QPA_PLATFORM=xcb
+RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-py310_25.1.1-2-Linux-x86_64.sh -O /tmp/miniconda.sh && \
+    bash /tmp/miniconda.sh -b -p "$CONDA_DIR" && \
+    rm -f /tmp/miniconda.sh && \
+    conda config --system --set auto_update_conda false && \
+    conda create -y -n phystwin python=3.10.19 pip && \
+    conda clean -afy
 
-# Install miniconda
-ENV CONDA_DIR="/opt/conda"
-RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh && \
-    /bin/bash ~/miniconda.sh -b -p /opt/conda
+WORKDIR /tmp/build/Phys-GS
 
-# Put conda in path so we can use conda activate
-ENV PATH=$CONDA_DIR/bin:$PATH
-RUN conda init bash 
+COPY requirements.txt /tmp/requirements.txt
 
-# Create a new conda environment
-RUN /opt/conda/bin/conda create -y -n phystwin_env python=3.10
+RUN conda run -n phystwin pip install --extra-index-url https://download.pytorch.org/whl/cu121 \
+    torch==2.4.1+cu121 torchvision==0.19.1+cu121 torchaudio==2.4.1+cu121
 
-# Set the working directory, non-root user, and permissions
-WORKDIR /PhysTwin
+RUN grep -vE '^(torch|torchvision|torchaudio)==|^#|^$' /tmp/requirements.txt > /tmp/requirements.runtime.txt && \
+    conda run -n phystwin pip install -r /tmp/requirements.runtime.txt
 
-# Copy contents of the repository to the container
-COPY --chmod=755 . .
+COPY . .
 
-# CUDA architecture settings
-# This is set to 8.6 for NVIDIA RTX 30 series GPUs (Ampere architecture)
-# If you are using a different GPU, make sure to set this to the correct architecture
-# You can find the list of CUDA architectures here: https://developer.nvidia.com/cuda-gpus
-ARG TORCH_CUDA_ARCH_LIST="8.6+PTX"
+RUN conda run -n phystwin pip install --no-index --no-cache-dir pytorch3d \
+    -f https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py310_cu121_pyt240/download.html
 
-# Activate the conda environment and install dependencies
-RUN /bin/bash -c "source activate phystwin_env && chmod +x env_install/env_install.sh && ./env_install/env_install.sh"
+RUN conda run -n phystwin pip install --no-build-isolation ./gaussian_splatting/submodules/diff-gaussian-rasterization && \
+    conda run -n phystwin pip install --no-build-isolation ./gaussian_splatting/submodules/simple-knn
 
-# Set the default command
+RUN echo "conda activate phystwin" >> /root/.bashrc && \
+    echo "conda activate phystwin" >> "/home/${USER_NAME}/.bashrc"
+
+WORKDIR /home/yyang/mnt/workspace
+
 CMD ["/bin/bash"]
