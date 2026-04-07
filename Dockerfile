@@ -54,6 +54,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     sudo \
     vim \
     wget \
+    xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-py310_25.1.1-2-Linux-x86_64.sh -O /tmp/miniconda.sh && \
