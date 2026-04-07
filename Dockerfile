@@ -73,7 +73,7 @@ COPY requirements.txt /tmp/requirements.txt
 RUN conda run -n phystwin pip install --extra-index-url https://download.pytorch.org/whl/cu121 \
     torch==2.4.1+cu121 torchvision==0.19.1+cu121 torchaudio==2.4.1+cu121
 
-RUN grep -vE '^(torch|torchvision|torchaudio)==|^#|^$' /tmp/requirements.txt > /tmp/requirements.runtime.txt && \
+RUN grep -vE '^(torch|torchvision|torchaudio)==|^pyrealsense2==|^#|^$' /tmp/requirements.txt > /tmp/requirements.runtime.txt && \
     conda run -n phystwin pip install -r /tmp/requirements.runtime.txt
 
 COPY . .
