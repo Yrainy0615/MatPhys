@@ -74,15 +74,15 @@ RUN conda run -n phystwin pip install --extra-index-url https://download.pytorch
     torch==2.4.1+cu121 torchvision==0.19.1+cu121 torchaudio==2.4.1+cu121
 
 RUN grep -vE '^(torch|torchvision|torchaudio)==|^pyrealsense2==|^#|^$' /tmp/requirements.txt > /tmp/requirements.runtime.txt && \
-    conda run -n phystwin pip install -r /tmp/requirements.runtime.txt
+    conda run --no-capture-output -n phystwin pip install -v -r /tmp/requirements.runtime.txt
 
 COPY . .
 
 RUN conda run -n phystwin pip install --no-index --no-cache-dir pytorch3d \
     -f https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py310_cu121_pyt240/download.html
 
-RUN conda run -n phystwin pip install --no-build-isolation ./gaussian_splatting/submodules/diff-gaussian-rasterization && \
-    conda run -n phystwin pip install --no-build-isolation ./gaussian_splatting/submodules/simple-knn
+RUN conda run --no-capture-output -n phystwin pip install --no-build-isolation ./gaussian_splatting/submodules/diff-gaussian-rasterization && \
+    conda run --no-capture-output -n phystwin pip install --no-build-isolation ./gaussian_splatting/submodules/simple-knn
 
 RUN echo "conda activate phystwin" >> /root/.bashrc && \
     echo "conda activate phystwin" >> "/home/${USER_NAME}/.bashrc"
