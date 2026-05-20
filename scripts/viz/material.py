@@ -86,9 +86,14 @@ if __name__ == "__main__":
     if args.model_path:
         best_model_path = args.model_path
     else:
-        candidates = glob.glob(f"experiments/{case_name}/train/best_*.pth")
-        assert candidates, f"No best model found in experiments/{case_name}/train/"
+        _train_dir = f"experiments/{case_name}/train"
+        candidates = (
+            glob.glob(f"{_train_dir}/best_pretrained.pth")
+            or sorted(glob.glob(f"{_train_dir}/best_*.pth"))
+        )
+        assert candidates, f"No best model found in {_train_dir}"
         best_model_path = candidates[0]
+        logger.info(f"Using checkpoint: {best_model_path}")
 
     # Detect whether the checkpoint was trained with edge gating
     checkpoint_keys = torch.load(best_model_path, map_location="cpu").keys()

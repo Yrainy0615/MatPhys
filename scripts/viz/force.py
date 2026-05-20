@@ -82,7 +82,14 @@ if __name__ == "__main__":
         pure_inference_mode=True,
     )
 
-    best_model_path = glob.glob(f"experiments/{case_name}/train/best_*.pth")[0]
+    _train_dir = f"experiments/{case_name}/train"
+    _candidates = (
+        glob.glob(f"{_train_dir}/best_pretrained.pth")
+        or sorted(glob.glob(f"{_train_dir}/best_*.pth"))
+    )
+    assert _candidates, f"No best_*.pth checkpoint found under {_train_dir}"
+    best_model_path = _candidates[0]
+    logger.info(f"Using checkpoint: {best_model_path}")
     trainer.visualize_force(
         best_model_path, gaussians_path, args.n_ctrl_parts
     )

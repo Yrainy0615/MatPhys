@@ -72,6 +72,11 @@ if __name__ == "__main__":
         base_dir=base_dir,
         pure_inference_mode=True,
     )
-    assert len(glob.glob(f"{base_dir}/train/best_*.pth")) > 0
-    best_model_path = glob.glob(f"{base_dir}/train/best_*.pth")[0]
+    _candidates = (
+        glob.glob(f"{base_dir}/train/best_pretrained.pth")
+        or sorted(glob.glob(f"{base_dir}/train/best_*.pth"))
+    )
+    assert _candidates, f"No best_*.pth checkpoint found under {base_dir}/train"
+    best_model_path = _candidates[0]
+    logger.info(f"Using checkpoint: {best_model_path}")
     trainer.test(best_model_path)

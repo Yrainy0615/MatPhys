@@ -93,7 +93,17 @@ if __name__ == "__main__":
         pure_inference_mode=True,
     )
 
-    best_model_path = glob.glob(f"experiments/{case_name}/train/best_*.pth")[0]
+    # Prefer the PhysicsNet-dumped checkpoint, then fall back to the highest-
+    # epoch per-scene optimization checkpoint. glob ordering is filesystem-
+    # dependent so never rely on [0] of the raw glob.
+    _train_dir = f"experiments/{case_name}/train"
+    _candidates = (
+        glob.glob(f"{_train_dir}/best_pretrained.pth")
+        or sorted(glob.glob(f"{_train_dir}/best_*.pth"))
+    )
+    assert _candidates, f"No best_*.pth checkpoint found under {_train_dir}"
+    best_model_path = _candidates[0]
+    logger.info(f"Using checkpoint: {best_model_path}")
     trainer.object_point_drag_playground(
         best_model_path,
         gaussians_path,
