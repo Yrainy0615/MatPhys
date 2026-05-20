@@ -18,7 +18,7 @@
 <span class="author-block"><sup>3</sup>Huawei Technologies Japan K.K.</span>
 
 
-### [Website]() | [Paper]() | [Arxiv]()
+### [Website]() | [Paper]() | [Arxiv](https://arxiv.org/abs/2605.19386)
 
 ### Overview
 This repository contains the official implementation of the **MatPhys** framework.
