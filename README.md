@@ -148,7 +148,7 @@ bash scripts/ours/train_single.sh monkey 0 \
 Useful env-var overrides: `OBJECT_RADIUS` (default `0.02`),
 `CONTROLLER_RADIUS` (default `0.04`).
 
-### All 22 multi-view cases
+### All  cases
 
 ```bash
 bash scripts/ours/train_all.sh
@@ -170,14 +170,6 @@ Each run uses
 | `--logk_soft_clamp` | `0.25` | clamp on residual around prior |
 | `--fit_all_frames` | — | fit train + test frames (per-case fit) |
 
-### Anti-vibration ablation
-
-```bash
-GPU=0 CASE=single_push_sloth bash scripts/ours/ablation_smooth_damp.sh
-```
-
-Four cells (bugfix-only / +acc_smooth / +damp_barrier / +both) on one
-case; ~2–3h each on a single GPU.
 
 ### Inference
 
@@ -205,9 +197,7 @@ Runs three metrics:
 For comparisons against the first-order per-edge optimization baseline
 (stored in `experiments_optimization/`), roll out predictions with
 `inference_warp.py` or `semantic/eval_simple_video.py` and feed them
-through the same evaluator. Always compare against the second-stage
-per-edge first-order optimization, not against the cotracker
-pseudo-GT.
+through the same evaluator. 
 
 ## Visualization
 
@@ -221,12 +211,4 @@ For interactive inspection: `interactive_playground.py`,
 `scripts/viz/material.py`, `scripts/viz/render_results.py`,
 `semantic/visualize_inference.py`.
 
-## Layout notes
 
-- Per-case predictor: `semantic/train_model_video_material_simple.py`
-  (trainer) + `semantic/models.py` (decoder) +
-  `semantic/material_param_dataset.py` (graph dataset).
-- Warp simulator: `qqtt/model/diff_simulator/spring_mass_warp.py`,
-  driven by `qqtt/engine/trainer_warp.py`.
-- 3DGS render-loss path: `semantic/train_models.gaussian_render_l1_loss`.
-- Reference per-edge optimizer (baseline): `qqtt/engine/cma_optimize_warp.py`.
