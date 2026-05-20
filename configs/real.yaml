@@ -26,11 +26,14 @@ collision_dist: 0.02
 collision_learn: true
 chamfer_weight: 1.0
 track_weight: 1.0
-# KNN + edge gating (end-to-end topology learning)
-use_knn_topology: true
+# Topology: radius-based (must stay false to match the trained checkpoints in
+# experiments/*/train/ and checkpoints/checkpoint_all_latest.pth, which were
+# all trained with use_knn_topology=false). Flipping this changes n_springs
+# and invalidates per-edge weights.
+use_knn_topology: false
 object_knn: 30
 controller_knn: 30
-use_edge_gating: true
+use_edge_gating: false
 k_base_from_rest_length: true
 edge_gate_init: 3.0
 k_base_scale: 1.0
