@@ -221,6 +221,13 @@ def main():
         "object_max_neighbours": int(getattr(args, "object_max_neighbours", 30)),
         "controller_radius": np.float64(getattr(args, "controller_radius", 0.04)),
         "controller_max_neighbours": int(getattr(args, "controller_max_neighbours", 50)),
+        # Self-describe topology so playground/inference rebuild the exact spring
+        # graph that was used to dump these params. Without this, downstream
+        # scripts fall back to whatever configs/*.yaml currently says and
+        # silently mismatch n_springs.
+        "use_knn_topology": bool(getattr(args, "use_knn_topology", False)),
+        "object_knn": int(getattr(args, "object_knn", 30)),
+        "controller_knn": int(getattr(args, "controller_knn", 30)),
         "collide_elas": np.float32(collide_elas),
         "collide_fric": np.float64(collide_fric),
         "collide_object_elas": np.float32(collide_obj_elas),
