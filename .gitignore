@@ -22,6 +22,7 @@
 # OS/editor noise
 .DS_Store
 ._*
+.nfs*
 
 # Python caches
 *.pyc
@@ -47,3 +48,6 @@ __pycache__/
 # External checkpoints downloaded locally
 data_process/groundedSAM_checkpoints/groundingdino_swint_ogc.pth
 data_process/groundedSAM_checkpoints/sam2.1_hiera_large.pt
+.vscode
+gaussian_output_dynamic/
+skills/

@@ -1,3 +1,5 @@
+import re
+
 import numpy as np
 import torch
 import warnings
@@ -6,9 +8,33 @@ import warp as wp
 
 warnings.filterwarnings(
     "ignore",
-    message=r".*recorded kernel apply_picked_points_cluster is configured with the option 'enable_backward=False'.*",
-    category=UserWarning,
+    message=r".*Running the tape backwards may produce incorrect gradients.*enable_backward=False.*",
+    category=Warning,
 )
+
+
+def _mute_warp_tape_enable_backward_warnings() -> None:
+    """Warp routes tape notices through wp._src.utils.warn(), which temporarily
+    forces warnings.simplefilter(\"default\") so global filterwarnings() does
+    not suppress them. Drop matching messages before they are emitted.
+    """
+    _pat = re.compile(
+        r"Running the tape backwards may produce incorrect gradients because recorded kernel .+ "
+        r"(?:is configured with the option 'enable_backward=False'\.|"
+        r"is defined in a module with the option 'enable_backward=False' set\.)"
+    )
+    _utils = wp._src.utils
+    _orig_warn = _utils.warn
+
+    def _warn(message, category=None, stacklevel=1, once=False):
+        if isinstance(message, str) and _pat.search(message):
+            return
+        return _orig_warn(message, category=category, stacklevel=stacklevel, once=once)
+
+    _utils.warn = _warn
+
+
+_mute_warp_tape_enable_backward_warnings()
 
 wp.init()
 _warp_has_cuda = wp.is_cuda_available()
@@ -99,7 +125,7 @@ def eval_springs(
     springs: wp.array(dtype=wp.vec2i),
     rest_lengths: wp.array(dtype=float),
     spring_Y: wp.array(dtype=float),
-    dashpot_damping: float,
+    wp_dashpot_damping: wp.array(dtype=wp.float32),
     spring_Y_min: float,
     spring_Y_max: float,
     f: wp.array(dtype=wp.vec3),
@@ -138,7 +164,7 @@ def eval_springs(
         )
 
         v_rel = wp.dot(v2 - v1, d)
-        dashpot_forces = dashpot_damping * v_rel * d
+        dashpot_forces = wp_dashpot_damping[0] * v_rel * d
 
         overall_force = spring_force + dashpot_forces
 
@@ -160,7 +186,7 @@ def eval_springs_gated(
     edge_gate: wp.array(dtype=float),
     log_a: wp.array(dtype=float),
     k_base: wp.array(dtype=float),
-    dashpot_damping: float,
+    wp_dashpot_damping: wp.array(dtype=wp.float32),
     spring_Y_min: float,
     spring_Y_max: float,
     f: wp.array(dtype=wp.vec3),
@@ -197,7 +223,7 @@ def eval_springs_gated(
 
     spring_force = k_eff * (dis_len / rest - 1.0) * d
     v_rel = wp.dot(v2 - v1, d)
-    dashpot_forces = w_ij * dashpot_damping * v_rel * d
+    dashpot_forces = w_ij * wp_dashpot_damping[0] * v_rel * d
     overall_force = spring_force + dashpot_forces
 
     if idx1 < num_object_points:
@@ -212,7 +238,7 @@ def update_vel_from_force(
     f: wp.array(dtype=wp.vec3),
     masses: wp.array(dtype=wp.float32),
     dt: float,
-    drag_damping: float,
+    wp_drag_damping: wp.array(dtype=wp.float32),
     reverse_factor: float,
     v_new: wp.array(dtype=wp.vec3),
 ):
@@ -222,7 +248,7 @@ def update_vel_from_force(
     f0 = f[tid]
     m0 = masses[tid]
 
-    drag_damping_factor = wp.exp(-dt * drag_damping)
+    drag_damping_factor = wp.exp(-dt * wp_drag_damping[0])
     all_force = f0 + m0 * wp.vec3(0.0, 0.0, -9.8) * reverse_factor
     a = all_force / m0
     v1 = v0 + a * dt
@@ -744,6 +770,7 @@ class SpringMassSystemWarp:
         logger.info(f"[SIMULATION]: Initialize the Spring-Mass System")
         self.use_edge_gating = use_edge_gating
         self.device = cfg.device
+        wp.set_device(self.device)
 
         # Record the parameters
         self.wp_init_vertices = wp.from_torch(
@@ -977,6 +1004,14 @@ class SpringMassSystemWarp:
             torch.tensor(
                 [collide_object_fric], dtype=torch.float32, device=self.device
             ),
+            requires_grad=cfg.collision_learn,
+        )
+        self.wp_dashpot_damping = wp.from_torch(
+            torch.tensor([dashpot_damping], dtype=torch.float32, device=self.device),
+            requires_grad=cfg.collision_learn,
+        )
+        self.wp_drag_damping = wp.from_torch(
+            torch.tensor([drag_damping], dtype=torch.float32, device=self.device),
             requires_grad=cfg.collision_learn,
         )
 
@@ -1380,7 +1415,7 @@ class SpringMassSystemWarp:
                         self.wp_edge_gate,
                         self.wp_log_a,
                         self.wp_k_base,
-                        self.dashpot_damping,
+                        self.wp_dashpot_damping,
                         self.spring_Y_min,
                         self.spring_Y_max,
                     ],
@@ -1399,7 +1434,7 @@ class SpringMassSystemWarp:
                         self.wp_springs,
                         self.wp_rest_lengths,
                         self.wp_spring_Y,
-                        self.dashpot_damping,
+                        self.wp_dashpot_damping,
                         self.spring_Y_min,
                         self.spring_Y_max,
                     ],
@@ -1434,7 +1469,7 @@ class SpringMassSystemWarp:
                     self.wp_states[i].wp_vertice_forces,
                     self.wp_masses,
                     self.dt,
-                    self.drag_damping,
+                    self.wp_drag_damping,
                     self.reverse_factor,
                 ],
                 outputs=[output_v],
@@ -1628,3 +1663,9 @@ class SpringMassSystemWarp:
             inputs=[collide_object_fric],
             outputs=[self.wp_collide_object_fric],
         )
+
+    def set_dashpot_damping(self, val: torch.Tensor):
+        wp.launch(copy_float, dim=1, inputs=[val], outputs=[self.wp_dashpot_damping])
+
+    def set_drag_damping(self, val: torch.Tensor):
+        wp.launch(copy_float, dim=1, inputs=[val], outputs=[self.wp_drag_damping])

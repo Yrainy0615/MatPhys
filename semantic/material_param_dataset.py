@@ -9,6 +9,16 @@ import numpy as np
 import open3d as o3d
 import torch
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
+
+
+def _load_structure_points(data_path: str) -> np.ndarray:
+    """Load concatenated structure points [N, 3] from final_data.pkl."""
+    with open(data_path, "rb") as f:
+        data = pickle.load(f)
+    return np.concatenate(
+        [data["object_points"][0], data["surface_points"], data["interior_points"]], axis=0
+    ).astype(np.float32)
 
 
 
@@ -220,8 +230,10 @@ def _build_controller_springs(
         else:
             _, idx, _ = pcd_tree.search_hybrid_vector_3d(pt, ctrl_radius, ctrl_max)
         for j in idx:
-            obj_indices.append(j)
-            rest_lengths.append(np.linalg.norm(pt - structure_points[j]))
+            rest_length = np.linalg.norm(pt - structure_points[j])
+            if rest_length > 1e-4:
+                obj_indices.append(j)
+                rest_lengths.append(rest_length)
 
     if len(obj_indices) == 0:
         return np.zeros(0, dtype=np.int64), np.zeros((0, 1), dtype=np.float32)
@@ -243,16 +255,6 @@ def _pick_best_ckpt(train_dir: str) -> str:
     return best_list[-1]
 
 
-def _load_optimal_params(experiments_optimization_dir: str, case_name: str) -> Dict:
-    optimal_path = os.path.join(
-        experiments_optimization_dir, case_name, "optimal_params.pkl"
-    )
-    if not os.path.exists(optimal_path):
-        return {}
-    with open(optimal_path, "rb") as f:
-        return pickle.load(f)
-
-    
 @dataclass
 class MaterialDatasetConfig:
     base_path: str
@@ -265,6 +267,8 @@ class MaterialDatasetConfig:
     object_knn: int = 20
     object_radius: float = 0.02
     object_max_neighbours: int = 30
+    controller_radius: float = 0.04
+    controller_max_neighbours: int = 50
 
 
 class MaterialParamDataset(Dataset):
@@ -307,6 +311,58 @@ class MaterialParamDataset(Dataset):
                 }
         return case_to_material_id, class_to_id
 
+    def _load_teacher_params(self, case_name: str, num_object_springs: int) -> Dict[str, torch.Tensor]:
+        """Load teacher-optimized physics params from PhysTwin first-order optimizer.
+
+        Returns tensors for:
+          - teacher_log_k: [E] per-edge log spring stiffness (from best_*.pth spring_Y)
+          - teacher_collision_dist, teacher_dashpot_damping, teacher_drag_damping: scalars
+        All values are float32 tensors. Returns None-filled dict if files are missing.
+        """
+        result: Dict[str, torch.Tensor] = {}
+
+        # Per-edge spring stiffness from first-order optimizer checkpoint
+        train_dir = os.path.join(self.cfg.experiments_dir, case_name, "train")
+        best_files = sorted(glob.glob(os.path.join(train_dir, "best_*.pth")))
+        if best_files:
+            best = torch.load(best_files[-1], map_location="cpu", weights_only=False)
+            spring_Y = best.get("spring_Y", None)
+            if spring_Y is not None:
+                spring_Y = spring_Y.view(-1).float()
+                if spring_Y.shape[0] >= num_object_springs:
+                    # trainer_warp stores all springs; object springs are initialized
+                    # first, followed by controller springs.
+                    result["teacher_log_k"] = torch.log(
+                        spring_Y[:num_object_springs].clamp(min=1e-6)
+                    )
+                else:
+                    # size mismatch (topology difference) — skip
+                    result["teacher_log_k"] = None
+            else:
+                result["teacher_log_k"] = None
+            # Collision params from best checkpoint
+            for key in ("collide_elas", "collide_fric", "collide_object_elas", "collide_object_fric"):
+                val = best.get(key, None)
+                if val is not None:
+                    result[f"teacher_{key}"] = val.view(-1).float()
+        else:
+            result["teacher_log_k"] = None
+            for key in ("collide_elas", "collide_fric", "collide_object_elas", "collide_object_fric"):
+                result[f"teacher_{key}"] = None
+
+        # Global scalar params from CMA optimization
+        opt_path = os.path.join(self.cfg.experiments_optimization_dir, case_name, "optimal_params.pkl")
+        if os.path.exists(opt_path):
+            with open(opt_path, "rb") as f:
+                opt = pickle.load(f)
+            for key in ("collision_dist", "dashpot_damping", "drag_damping"):
+                result[f"teacher_{key}"] = torch.tensor([float(opt[key])], dtype=torch.float32)
+        else:
+            for key in ("collision_dist", "dashpot_damping", "drag_damping"):
+                result[f"teacher_{key}"] = None
+
+        return result
+
     def _build_sample(self, case_name: str) -> Dict[str, torch.Tensor]:
         case_dir = os.path.join(self.cfg.base_path, case_name)
         final_data_path = os.path.join(case_dir, "final_data.pkl")
@@ -332,6 +388,7 @@ class MaterialParamDataset(Dataset):
 
         sem_path = os.path.join(self.cfg.sem_cache_dir, f"{case_name}_node_sem.npz")
         node_sem = np.load(sem_path)["node_sem"].astype(np.float32)
+        node_sem = node_sem / (np.linalg.norm(node_sem, axis=1, keepdims=True) + 1e-8)
         if node_sem.shape[0] != points.shape[0]:
             raise ValueError(
                 f"node_sem point count mismatch for {case_name}: "
@@ -340,8 +397,12 @@ class MaterialParamDataset(Dataset):
         z_sem = _edge_sem_from_node(node_sem, edges)
         z_sem_global = node_sem.mean(axis=0, keepdims=True).astype(np.float32)  # [1, D]
 
-        # Load VLM-precomputed material distribution and part assignments
-        material_dist, edge_part_idx, point_part, part_features = self._load_material_dist(
+        # Load material distribution, part assignments, and GPT physics prior
+        (
+            material_dist, edge_part_idx, point_part, part_features,
+            part_phys_prior_mu, part_phys_prior_log_sigma, part_phys_prior_conf,
+            global_phys_prior_mu, global_phys_prior_log_sigma, global_phys_prior_conf,
+        ) = self._load_material_dist(
             case_name, points, edges
         )
 
@@ -350,23 +411,24 @@ class MaterialParamDataset(Dataset):
         edge_part_idx_np = edge_part_idx.numpy()
         z_geo = _geo_features(points, edges, point_part_np, edge_part_idx_np)
 
-        ckpt = torch.load(
-            _pick_best_ckpt(os.path.join(self.cfg.experiments_dir, case_name, "train")),
-            map_location="cpu",
-            weights_only=False,
-        )
-        num_object_springs = int(ckpt.get("num_object_springs", ckpt["spring_Y"].numel()))
-        teacher_k = ckpt["spring_Y"].float().view(-1, 1)[:num_object_springs]
-        base_spring_y = ckpt["spring_Y"].float().view(-1)
-        if teacher_k.shape[0] != edges.shape[0]:
-            raise ValueError(
-                f"teacher_k size mismatch for {case_name}: {teacher_k.shape[0]} vs {edges.shape[0]} "
-                f"(topology mismatch with first-order run; "
-                f"use_knn_topology={topology_cfg['use_knn_topology']}, "
-                f"object_knn={topology_cfg['object_knn']}, "
-                f"object_radius={topology_cfg['object_radius']}, "
-                f"object_max_neighbours={topology_cfg['object_max_neighbours']})"
-            )
+        # Scene-level geometric statistics for global decoder conditioning
+        _rest_lengths = np.linalg.norm(
+            points[edges[:, 0]] - points[edges[:, 1]], axis=1
+        ).astype(np.float32)
+        _bbox = points.max(axis=0) - points.min(axis=0)
+        geo_stats = np.array([
+            float(_rest_lengths.mean()),                         # mean spring length
+            float(_rest_lengths.std() + 1e-6),                  # spread of spring lengths
+            float(np.log(len(points) + 1)),                     # log num nodes
+            float(np.log(len(edges) + 1)),                      # log num edges
+            float(np.linalg.norm(_bbox)),                       # bbox diagonal (physical scale)
+            float(2.0 * len(edges) / max(len(points), 1)),      # mean degree
+        ], dtype=np.float32)
+
+        num_object_springs = int(edges.shape[0])
+
+        # Load teacher-optimized physics params for regression supervision
+        teacher_params = self._load_teacher_params(case_name, num_object_springs)
 
         # Build controller spring features
         controller_points = final_data.get("controller_points", None)
@@ -388,13 +450,6 @@ class MaterialParamDataset(Dataset):
             split = json.load(f)
         train_frame = int(split["train"][1])
 
-        optimal_params = _load_optimal_params(
-            self.cfg.experiments_optimization_dir, case_name
-        )
-        teacher_collision_dist = float(optimal_params.get("collision_dist", 0.02))
-        teacher_drag_damping = float(optimal_params.get("drag_damping", 3.0))
-        teacher_dashpot_damping = float(optimal_params.get("dashpot_damping", 100.0))
-
         metadata_path = os.path.join(case_dir, "metadata.json")
         with open(metadata_path, "r") as f:
             metadata = json.load(f)
@@ -414,34 +469,29 @@ class MaterialParamDataset(Dataset):
             "wh": torch.from_numpy(wh).long(),
             "edges": torch.from_numpy(edges).long(),
             "z_geo": torch.from_numpy(z_geo).float(),
+            "geo_stats": torch.from_numpy(geo_stats).float(),   # [6] scene-level geometry stats
             "edge_mid": torch.from_numpy(edge_mid).float(),
             "z_sem": torch.from_numpy(z_sem).float(),
             "z_sem_global": torch.from_numpy(z_sem_global).float(),
             "part_features": part_features.float(),      # [K, D]
             "material_dist": material_dist,        # [K, M]
             "edge_part_idx": edge_part_idx,        # [E]
+            "part_phys_prior_mu": part_phys_prior_mu,
+            "part_phys_prior_log_sigma": part_phys_prior_log_sigma,
+            "part_phys_prior_conf": part_phys_prior_conf,
+            **({"global_phys_prior_mu":        global_phys_prior_mu,
+                "global_phys_prior_log_sigma": global_phys_prior_log_sigma,
+                "global_phys_prior_conf":      global_phys_prior_conf}
+               if global_phys_prior_mu is not None else {}),
             # Controller spring features
             "ctrl_sem": torch.from_numpy(ctrl_sem).float(),            # [C, D]
             "ctrl_rest_length": torch.from_numpy(ctrl_rest_length).float(),  # [C, 1]
             "ctrl_part_idx": ctrl_part_idx if isinstance(ctrl_part_idx, torch.Tensor)
                              else torch.from_numpy(ctrl_part_idx).long(),    # [C]
             "num_object_springs": torch.tensor(num_object_springs, dtype=torch.long),
-            "teacher_logk": teacher_k.log(),
-            "base_spring_y": base_spring_y,
-            "collide_elas": ckpt["collide_elas"].float().view(1),
-            "collide_fric": ckpt["collide_fric"].float().view(1),
-            "collide_object_elas": ckpt["collide_object_elas"].float().view(1),
-            "collide_object_fric": ckpt["collide_object_fric"].float().view(1),
-            "teacher_collision_dist": torch.tensor(
-                [teacher_collision_dist], dtype=torch.float32
-            ),
-            "teacher_drag_damping": torch.tensor(
-                [teacher_drag_damping], dtype=torch.float32
-            ),
-            "teacher_dashpot_damping": torch.tensor(
-                [teacher_dashpot_damping], dtype=torch.float32
-            ),
             "material_id": torch.tensor(int(self.case_to_material[case_name]), dtype=torch.long),
+            # Teacher-optimized params for regression supervision
+            **{k: v for k, v in teacher_params.items() if v is not None},
         }
 
     def _load_material_dist(
@@ -475,6 +525,10 @@ class MaterialParamDataset(Dataset):
                 torch.zeros(E, dtype=torch.long),
                 torch.zeros(N, dtype=torch.long),
                 torch.zeros((K, 1024), dtype=torch.float32),
+                torch.full((K, 1), float(np.log(1.0e4)), dtype=torch.float32),
+                torch.zeros((K, 1), dtype=torch.float32),
+                torch.zeros((K, 1), dtype=torch.float32),
+                None, None, None,   # global_phys_prior (no GPT prior available)
             )
 
         train_ready = torch.load(train_ready_path, map_location="cpu", weights_only=False)
@@ -482,6 +536,9 @@ class MaterialParamDataset(Dataset):
         mat_dists = train_ready["material_distributions"]       # [K, M]
         part_features = train_ready.get("part_features", None)  # [K, D]
         gs_xyz = train_ready["xyz"].numpy()                     # [N_gs, 3]
+        part_phys_prior_mu = train_ready.get("part_phys_prior_mu", None)
+        part_phys_prior_log_sigma = train_ready.get("part_phys_prior_log_sigma", None)
+        part_phys_prior_conf = train_ready.get("part_phys_prior_conf", None)
 
         # Transfer gaussian part assignments to structure points via NN
         from scipy.spatial import cKDTree
@@ -497,43 +554,91 @@ class MaterialParamDataset(Dataset):
 
         self.num_materials = int(mat_dists.shape[1])
 
+        K = int(mat_dists.shape[0])
         if part_features is None:
             D = 1024
-            K = int(mat_dists.shape[0])
             part_features = torch.zeros((K, D), dtype=torch.float32)
+        if part_phys_prior_mu is None:
+            part_phys_prior_mu = torch.full((K, 1), float(np.log(1.0e4)), dtype=torch.float32)
+        if part_phys_prior_log_sigma is None:
+            part_phys_prior_log_sigma = torch.zeros((K, 1), dtype=torch.float32)
+        if part_phys_prior_conf is None:
+            part_phys_prior_conf = torch.zeros((K, 1), dtype=torch.float32)
+
+        # Load global prior from train_ready.pt if present
+        global_phys_prior_mu        = train_ready.get("global_phys_prior_mu",        None)
+        global_phys_prior_log_sigma = train_ready.get("global_phys_prior_log_sigma", None)
+        global_phys_prior_conf      = train_ready.get("global_phys_prior_conf",      None)
+
+        # Override with GPT-queried physics prior if available (takes precedence)
+        gpt_prior_path = os.path.join(self.cfg.results_dir, case_name, "gpt_physics_prior.json")
+        if os.path.exists(gpt_prior_path):
+            with open(gpt_prior_path) as _f:
+                gpt = json.load(_f)
+
+            # Per-part log_k prior
+            for entry in gpt.get("parts", []):
+                k_idx = int(entry["part_idx"])
+                if k_idx < K:
+                    part_phys_prior_mu[k_idx, 0]        = float(entry["log_k"]["mu"])
+                    part_phys_prior_log_sigma[k_idx, 0] = float(entry["log_k"]["log_sigma"])
+                    part_phys_prior_conf[k_idx, 0]      = float(entry.get("conf", 0.8))
+
+            # Global prior: [1, 7] matching compute_global_physics_prior_loss order
+            # order: collide_elas, collide_fric, collide_object_elas, collide_object_fric,
+            #        collision_dist, dashpot_damping, drag_damping
+            g = gpt.get("global", {})
+            _g_keys = ["collide_elas", "collide_fric", "collide_object_elas",
+                       "collide_object_fric", "collision_dist", "dashpot_damping", "drag_damping"]
+            global_phys_prior_mu = torch.tensor(
+                [[g[k]["mu"] for k in _g_keys]], dtype=torch.float32)
+            global_phys_prior_log_sigma = torch.tensor(
+                [[g[k]["log_sigma"] for k in _g_keys]], dtype=torch.float32)
+            global_phys_prior_conf = torch.tensor(
+                [[float(g.get("conf", 0.5))]], dtype=torch.float32)
 
         return (
             mat_dists.float(),
             edge_part_idx.long(),
             point_part.long(),
             part_features.float(),
+            part_phys_prior_mu.float(),
+            part_phys_prior_log_sigma.float(),
+            part_phys_prior_conf.float(),
+            global_phys_prior_mu,
+            global_phys_prior_log_sigma,
+            global_phys_prior_conf,
         )
 
     def _load_topology_from_optimization(self, case_name: str) -> Dict[str, float]:
-        cfg = {
+        """Load per-case topology from stage-1 optimal_params.pkl when available so
+        the dataset edge set matches the second-stage baseline. Falls back to cfg
+        defaults if the file is missing."""
+        topo = {
             "use_knn_topology": bool(self.cfg.use_knn_topology),
             "object_knn": int(self.cfg.object_knn),
             "object_radius": float(self.cfg.object_radius),
             "object_max_neighbours": int(self.cfg.object_max_neighbours),
-            # Controller spring topology defaults
-            "controller_radius": 0.04,
-            "controller_max_neighbours": 50,
+            "controller_radius": float(self.cfg.controller_radius),
+            "controller_max_neighbours": int(self.cfg.controller_max_neighbours),
             "controller_knn": 30,
         }
-        optimal_path = os.path.join(
-            self.cfg.experiments_optimization_dir, case_name, "optimal_params.pkl"
-        )
-        if not os.path.exists(optimal_path):
-            return cfg
-
-        optimal_params = _load_optimal_params(
-            self.cfg.experiments_optimization_dir, case_name
-        )
-
-        for key in cfg:
-            if key in optimal_params:
-                cfg[key] = type(cfg[key])(optimal_params[key])
-        return cfg
+        opt_path = os.path.join(self.cfg.experiments_optimization_dir, case_name, "optimal_params.pkl")
+        if os.path.exists(opt_path):
+            try:
+                with open(opt_path, "rb") as f:
+                    opt = pickle.load(f)
+                for k, t in (
+                    ("object_radius", float),
+                    ("object_max_neighbours", int),
+                    ("controller_radius", float),
+                    ("controller_max_neighbours", int),
+                ):
+                    if k in opt:
+                        topo[k] = t(opt[k])
+            except Exception:
+                pass
+        return topo
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -542,22 +647,39 @@ class MaterialParamDataset(Dataset):
         return self.samples[idx]
 
 
+_TEACHER_KEYS = [
+    "teacher_log_k",
+    "teacher_collide_elas",
+    "teacher_collide_fric",
+    "teacher_collide_object_elas",
+    "teacher_collide_object_fric",
+    "teacher_collision_dist",
+    "teacher_dashpot_damping",
+    "teacher_drag_damping",
+]
+
+
 def collate_graph_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, List[torch.Tensor]]:
     keys = [
         "case_name", "case_dir", "final_data_path", "train_frame",
         "cam0_intrinsics", "cam0_w2c", "wh", "edges",
-        "z_geo", "edge_mid", "z_sem", "z_sem_global", "part_features", "material_dist", "edge_part_idx",
+        "z_geo", "geo_stats", "edge_mid", "z_sem", "z_sem_global", "part_features", "material_dist", "edge_part_idx",
+        "part_phys_prior_mu", "part_phys_prior_log_sigma", "part_phys_prior_conf",
+        "global_phys_prior_mu", "global_phys_prior_log_sigma", "global_phys_prior_conf",
         "ctrl_sem", "ctrl_rest_length", "ctrl_part_idx", "num_object_springs",
-        "teacher_logk", "base_spring_y",
-        "collide_elas", "collide_fric", "collide_object_elas", "collide_object_fric",
-        "teacher_collision_dist", "teacher_drag_damping", "teacher_dashpot_damping",
         "material_id",
+        *_TEACHER_KEYS,
     ]
+    _OPTIONAL_KEYS = set(_TEACHER_KEYS) | {
+        "global_phys_prior_mu", "global_phys_prior_log_sigma", "global_phys_prior_conf",
+    }
     out: Dict[str, list] = {k: [] for k in keys}
     for sample in batch:
         for k in keys:
             if k in sample:
                 out[k].append(sample[k])
+            elif k in _OPTIONAL_KEYS:
+                out[k].append(None)
     return out
 
 
@@ -584,6 +706,9 @@ def create_train_test_dataloaders(
     num_workers: int = 0,
     train_ratio: float = 0.8,
     seed: int = 42,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> Tuple[MaterialParamDataset, DataLoader, DataLoader]:
     """Create train and test dataloaders with random 8:2 split (train_ratio : 1-train_ratio).
 
@@ -619,10 +744,24 @@ def create_train_test_dataloaders(
     train_subset = torch.utils.data.Subset(full_dataset, train_indices)
     test_subset = torch.utils.data.Subset(full_dataset, test_indices)
 
+    train_sampler = None
+    train_shuffle = True
+    if distributed:
+        train_sampler = DistributedSampler(
+            train_subset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=seed,
+            drop_last=False,
+        )
+        train_shuffle = False
+
     train_loader = DataLoader(
         train_subset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=train_shuffle,
+        sampler=train_sampler,
         num_workers=num_workers,
         collate_fn=collate_graph_batch,
     )
@@ -637,8 +776,9 @@ def create_train_test_dataloaders(
 
     train_cases = [full_dataset.samples[i]["case_name"] for i in train_indices]
     test_cases = [full_dataset.samples[i]["case_name"] for i in test_indices]
-    print(f"[Dataset Split] Random 8:2 (seed={seed}) — Total: {n_samples}, Train: {len(train_indices)}, Test: {len(test_indices)}")
-    print(f"  Train: {train_cases}")
-    print(f"  Test:  {test_cases}")
+    if rank == 0:
+        print(f"[Dataset Split] Random 8:2 (seed={seed}) — Total: {n_samples}, Train: {len(train_indices)}, Test: {len(test_indices)}")
+        print(f"  Train: {train_cases}")
+        print(f"  Test:  {test_cases}")
 
     return full_dataset, train_loader, test_loader

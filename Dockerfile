@@ -36,6 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libgl1-mesa-dev \
     libglew-dev \
+    mesa-common-dev \
     libglib2.0-0 \
     libglu1-mesa-dev \
     libglfw3-dev \
@@ -75,7 +76,8 @@ RUN conda run -n phystwin pip install --extra-index-url https://download.pytorch
     torch==2.4.1+cu121 torchvision==0.19.1+cu121 torchaudio==2.4.1+cu121
 
 RUN grep -vE '^(torch|torchvision|torchaudio)==|^pyrealsense2==|^#|^$' /tmp/requirements.txt > /tmp/requirements.runtime.txt && \
-    conda run --no-capture-output -n phystwin pip install -v -r /tmp/requirements.runtime.txt
+    conda run --no-capture-output -n phystwin pip install -v -r /tmp/requirements.runtime.txt && \
+    conda run --no-capture-output -n phystwin pip install taming-transformers-rom1504 --no-deps
 
 COPY . .
 
@@ -84,6 +86,8 @@ RUN conda run -n phystwin pip install --no-index --no-cache-dir pytorch3d \
 
 RUN conda run --no-capture-output -n phystwin pip install --no-build-isolation ./gaussian_splatting/submodules/diff-gaussian-rasterization && \
     conda run --no-capture-output -n phystwin pip install --no-build-isolation ./gaussian_splatting/submodules/simple-knn
+
+RUN conda run --no-capture-output -n phystwin pip install --no-build-isolation ./gridencoder
 
 RUN echo "conda activate phystwin" >> /root/.bashrc && \
     echo "conda activate phystwin" >> "/home/${USER_NAME}/.bashrc"

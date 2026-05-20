@@ -40,7 +40,8 @@ from sklearn.cluster import KMeans
 import copy
 import time
 import threading
-import time
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 
 try:
     from pynput import keyboard
@@ -277,10 +278,10 @@ class InvPhyTrainerWarp:
                                 controller_max_neighbours,
                             )
                         for j in idx:
-                            springs.append([num_object_points + i, j])
-                            rest_lengths.append(
-                                np.linalg.norm(controller_points[i] - points[j])
-                            )
+                            rest_length = np.linalg.norm(controller_points[i] - points[j])
+                            if rest_length > 1e-4:
+                                springs.append([num_object_points + i, j])
+                                rest_lengths.append(rest_length)
 
                 springs = np.asarray(springs, dtype=np.int32)
                 rest_lengths = np.asarray(rest_lengths, dtype=np.float32)
@@ -299,7 +300,7 @@ class InvPhyTrainerWarp:
 
             # Connect the springs of the objects first
             points = np.asarray(object_pcd.points)
-            spring_flags = np.zeros((len(points), len(points)))
+            edge_set = set()
             springs = []
             rest_lengths = []
             for i in range(len(points)):
@@ -314,15 +315,11 @@ class InvPhyTrainerWarp:
                 idx = idx[1:]
                 for j in idx:
                     rest_length = np.linalg.norm(points[i] - points[j])
-                    if (
-                        spring_flags[i, j] == 0
-                        and spring_flags[j, i] == 0
-                        and rest_length > 1e-4
-                    ):
-                        spring_flags[i, j] = 1
-                        spring_flags[j, i] = 1
+                    key = (min(i, j), max(i, j))
+                    if key not in edge_set and rest_length > 1e-4:
+                        edge_set.add(key)
                         springs.append([i, j])
-                        rest_lengths.append(np.linalg.norm(points[i] - points[j]))
+                        rest_lengths.append(rest_length)
 
             num_object_springs = len(springs)
 
@@ -343,10 +340,10 @@ class InvPhyTrainerWarp:
                             controller_max_neighbours,
                         )
                     for j in idx:
-                        springs.append([num_object_points + i, j])
-                        rest_lengths.append(
-                            np.linalg.norm(controller_points[i] - points[j])
-                        )
+                        rest_length = np.linalg.norm(controller_points[i] - points[j])
+                        if rest_length > 1e-4:
+                            springs.append([num_object_points + i, j])
+                            rest_lengths.append(rest_length)
 
             springs = np.array(springs)
             rest_lengths = np.array(rest_lengths)
@@ -363,8 +360,11 @@ class InvPhyTrainerWarp:
             unique_values = np.unique(mask)
             points = object_points  # keep original point order
 
+            # Per-cluster adaptive topology params (set by CaseRuntime before trainer init)
+            per_cluster_params = getattr(cfg, "adaptive_topology_params", None)
+
             # Build per-cluster spring topology (edges only within each cluster)
-            spring_flags = np.zeros((len(points), len(points)))
+            edge_set = set()
             springs = []
             rest_lengths = []
             for value in unique_values:
@@ -373,8 +373,14 @@ class InvPhyTrainerWarp:
                 cluster_pcd = o3d.geometry.PointCloud()
                 cluster_pcd.points = o3d.utility.Vector3dVector(cluster_points)
                 cluster_tree = o3d.geometry.KDTreeFlann(cluster_pcd)
-                # Cap KNN by cluster size to avoid over-connectivity in small clusters
-                effective_knn = min(object_knn, len(cluster_points) - 1)
+
+                # Per-cluster K and r; fall back to global values when not available
+                if per_cluster_params is not None and int(value) in per_cluster_params:
+                    ck, cr = per_cluster_params[int(value)]
+                else:
+                    ck, cr = object_knn, object_radius
+                effective_knn = min(ck, len(cluster_points) - 1)
+
                 for li in range(len(cluster_points)):
                     gi = cluster_indices[li]  # global index
                     if use_knn_topology:
@@ -383,21 +389,45 @@ class InvPhyTrainerWarp:
                         )
                     else:
                         [k, idx, _] = cluster_tree.search_hybrid_vector_3d(
-                            cluster_points[li], object_radius, object_max_neighbours
+                            cluster_points[li], cr, effective_knn
                         )
                     idx = idx[1:]
                     for lj in idx:
                         gj = cluster_indices[lj]  # global index
                         rest_length = np.linalg.norm(points[gi] - points[gj])
-                        if (
-                            spring_flags[gi, gj] == 0
-                            and spring_flags[gj, gi] == 0
-                            and rest_length > 1e-4
-                        ):
-                            spring_flags[gi, gj] = 1
-                            spring_flags[gj, gi] = 1
+                        key = (min(gi, gj), max(gi, gj))
+                        if key not in edge_set and rest_length > 1e-4:
+                            edge_set.add(key)
                             springs.append([gi, gj])
                             rest_lengths.append(rest_length)
+
+            # Inter-part boundary connections (cross-cluster K_inter nearest neighbours)
+            if per_cluster_params is not None and "__inter__" in per_cluster_params:
+                K_inter = per_cluster_params["__inter__"][0]
+                if K_inter > 0 and len(unique_values) > 1:
+                    full_pcd = o3d.geometry.PointCloud()
+                    full_pcd.points = o3d.utility.Vector3dVector(points)
+                    full_tree = o3d.geometry.KDTreeFlann(full_pcd)
+                    for value in unique_values:
+                        cluster_indices = np.where(mask == value)[0]
+                        for gi in cluster_indices:
+                            search_n = min(K_inter * 20 + 1, len(points))
+                            [_, nn_idx, _] = full_tree.search_knn_vector_3d(
+                                points[gi], search_n
+                            )
+                            cross_added = 0
+                            for gj in list(nn_idx)[1:]:
+                                if cross_added >= K_inter:
+                                    break
+                                if int(mask[gj]) != int(value):
+                                    rest_length = np.linalg.norm(points[gi] - points[gj])
+                                    if rest_length > 1e-4:
+                                        key = (min(gi, gj), max(gi, gj))
+                                        if key not in edge_set:
+                                            edge_set.add(key)
+                                            springs.append([gi, gj])
+                                            rest_lengths.append(rest_length)
+                                    cross_added += 1
 
             num_object_springs = len(springs)
 
@@ -421,10 +451,10 @@ class InvPhyTrainerWarp:
                             controller_max_neighbours,
                         )
                     for j in idx:
-                        springs.append([num_object_points + i, j])
-                        rest_lengths.append(
-                            np.linalg.norm(controller_points[i] - points[j])
-                        )
+                        rest_length = np.linalg.norm(controller_points[i] - points[j])
+                        if rest_length > 1e-4:
+                            springs.append([num_object_points + i, j])
+                            rest_lengths.append(rest_length)
 
             springs = np.array(springs)
             rest_lengths = np.array(rest_lengths)
@@ -529,7 +559,13 @@ class InvPhyTrainerWarp:
                 step=i,
             )
 
-            logger.info(f"[Train]: Iteration: {i}, Loss: {total_loss}")
+            if cfg.data_type == "real":
+                logger.info(
+                    f"[Train]: Iteration: {i}, Loss: {total_loss}, "
+                    f"track: {total_track_loss}, chamfer: {total_chamfer_loss}"
+                )
+            else:
+                logger.info(f"[Train]: Iteration: {i}, Loss: {total_loss}")
 
             if i % cfg.vis_interval == 0 or i == cfg.iterations - 1:
                 video_path = f"{cfg.base_dir}/train/sim_iter{i}.mp4"
@@ -1527,10 +1563,10 @@ class InvPhyTrainerWarp:
     def interactive_playground(
         self, model_path, gs_path, n_ctrl_parts=1, inv_ctrl=False, virtual_key_input=False
     ):
-        if keyboard is None:
+        if keyboard is None and not virtual_key_input:
             raise ImportError(
                 "interactive_playground requires an X server because pynput is unavailable "
-                "in the current environment."
+                "in the current environment. Use --virtual_key_input to run headless."
             )
         # Load the model
         logger.info(f"Load model from {model_path}")
@@ -1677,9 +1713,12 @@ class InvPhyTrainerWarp:
             # Initialize keyboard tracking variables
             self.virtual_keys = {}     # Dictionary to track virtual keys with timestamps
             self.virtual_key_duration = 0.03  # Virtual key press duration in seconds
-        
-        listener = keyboard.Listener(on_press=self.on_press, on_release=self.on_release)
-        listener.start()
+
+        if keyboard is not None:
+            listener = keyboard.Listener(on_press=self.on_press, on_release=self.on_release)
+            listener.start()
+        elif not virtual_key_input:
+            raise RuntimeError("pynput.keyboard unavailable; pass --virtual_key_input")
         self.target_change = np.zeros((n_ctrl_parts, 3))
 
         ############## Temporary timer ##############

@@ -1,296 +1,210 @@
-# PhysTwin: Physics-Informed Reconstruction and Simulation of Deformable Objects from Videos
+# MatPhys: Learning material-aware physics parameters for deformable object simulation from videos
 
 <span class="author-block">
-<a target="_blank" href="https://jianghanxiao.github.io/">Hanxiao Jiang</a><sup>1,2</sup>,
+<a target="_blank" href="https://yrainy0615.github.io/">Yang Yang</a><sup>1,3</sup>,
 </span>
 <span class="author-block">
-<a target="_blank" href="https://haoyuhsu.github.io/">Hao-Yu Hsu</a><sup>2</sup>,
+<a target="_blank">Yiyan Wang</a><sup>2,3</sup>,
 </span>
 <span class="author-block">
-<a target="_blank" href="https://kywind.github.io/">Kaifeng Zhang</a><sup>1</sup>,
+<a target="_blank">Zheming Liu</a><sup>3</sup>,
 </span>
 <span class="author-block">
-<a target="_blank" href="https://www.linkedin.com/in/hnyu/">Hsin-Ni Yu</a><sup>2</sup>,
-</span>
-<span class="author-block">
-<a target="_blank" href="https://shenlong.web.illinois.edu/">Shenlong Wang</a><sup>2</sup>,
-</span>
-<span class="author-block">
-<a target="_blank" href="https://yunzhuli.github.io/">Yunzhu Li</a><sup>1</sup>
+<a target="_blank" href="https://iwanao731.github.io/">Naoya Iwamoto</a><sup>3</sup>,
 </span>
 
-<span class="author-block"><sup>1</sup>Columbia University,</span>
-<span class="author-block"><sup>2</sup>University of Illinois Urbana-Champaign</span>
+<span class="author-block"><sup>1</sup>The University of Osaka</span>
+<span class="author-block"><sup>2</sup>The Univerisity of Tokyo</span>
+<span class="author-block"><sup>3</sup>Huawei Technologies Japan K.K.</span>
 
-### [Website](https://jianghanxiao.github.io/phystwin-web/) | [Paper](https://jianghanxiao.github.io/phystwin-web/phystwin.pdf) | [Arxiv](https://arxiv.org/abs/2503.17973)
+
+### [Website]() | [Paper]() | [Arxiv]()
 
 ### Overview
-This repository contains the official implementation of the **PhysTwin** framework.
+This repository contains the official implementation of the **MatPhys** framework.
 
-![TEASER](./assets/teaser.png)
-
-
-### Update
-**This repository will be actively maintained by the authors, with continuous updates introducing new features to inspire further research.**
-
-- **Actively Developing:** In the long term, we aim to develop a comprehensive physics simulator focused on real-to-sim, serving as an easy-to-use platform for XR, VR, and robotics applications. **Feel free to reach out via email if you’re also interested in this direction and would like to collaborate on related research projects.**
-
-- **[26.1.21] Add Web Visualization for Headless Server Runs:** Thanks to @CAN-Lee, The interactive playground is now supported through Gradio, enabling web-based interaction even when running on a server without a display. (See below for detailed instructions)
-
-- **[25.11.6] Extend PhysTwin wiht robot physics support:** Explore our extended system [Real2Sim-Eval](https://real2sim-eval.github.io/), which supports both keyboard and Gello-based robot control, enabling physics-based interactions with constructed PhysTwins. We are actively developing a full robotics simulator that will serve as an easy-to-use platform for diverse research applications. A demo version will also be released in this repository soon.
-
-- **[25.10.26] Speed Acceleration for Self-Collision Cases:** For scenarios involving self-collision, instead of checking all particle pairs within a distance threshold, we introduce a mechanism to ignore topologically adjacent particle pairs. This significantly accelerates both optimization and inference in cloth-like cases where self-collision is activated. The main modification is implemented in [code](https://github.com/Jianghanxiao/PhysTwin/blob/release_collision_accelerate/qqtt/engine/trainer_warp.py#L179),and the feature is available in the branch `release_collision_accelerate`. This is a pre-released feature developed as part of an ongoing project. The fully accelerated system will be released once the complete system is done.
-
-![accelerated_example](./assets/cloth_collision_accelerate.gif)
-
-- **[25.7.22] Remote Control Feature & Bug Fix:** Fixed a deprojection error in the data processing pipeline. Added support for remote control—previously, the interactive playground only responded to physical keyboard input; it now accepts virtual keyboard signals from remote devices as well.
-
-- **[25.4.15] GPU Memory Optimization:** Thanks to user feedback and testing, we've further optimized the code to reduce GPU memory usage in the interactive playground—now requiring only about 2GB in total. Previously, LBS initialization consumed a significant amount of GPU memory; it's now offloaded to the CPU and only needs to run once at startup. Everything runs smoothly as a result.
-
-- **[25.4.8] Optmization Speed:** Regarding the questions on optimization speed, thanks to Nvidia Warp, our differentiable Spring-Mass simulator enables first-order optimization in approximately 5 minutes—and even faster with visualizations disabled—significantly outperforming prior work that typically requires hours. The zero-order, sampling-based optimization (CMA-ES) takes around 12 minutes, depending on the number of epochs. These statistics are based on the stuffed animal experiments without self-collision enabled.
-  
-- **[25.4.4] Material Visualization:** Show the experimental features to visualize the materials approximated from the underlying spring-mass model. (See below for detailed instructions)
-<p align="center">
-  <img src="./assets/material_rope.gif" width="30%">
-  <img src="./assets/material_cloth.gif" width="30%">
-  <img src="./assets/material_sloth.gif" width="30%">
-</p>
-
-
-- **[25.4.3] Multiple Objects Demos:** Show the experimental features for handling collisions among multiple PhysTwins we construct. (See below for detailed instructions)
-<p align="center">
-  <img src="./assets/rope_multiple.gif" width="45%">
-  <img src="./assets/sloth_multiple.gif" width="45%">
-</p>
-
-- **[25.4.3] LBS GPU Memory Fix:** Clear intermediate variables to significantly reduce GPU memory usage in the interactive playground. The sloth case now requires only about 4GB in total. (Pull the latest code to apply the fix.)
-
-- **[25.4.1] Force Visualization:** Visualize the forces applied to objects after optimization, aiding in force analysis from videos. (See below for detailed instructions)
-<p align="center">
-  <img src="./assets/force_rope.gif" width="30%">
-  <img src="./assets/force_cloth.gif" width="30%">
-  <img src="./assets/force_sloth.gif" width="30%">
-</p>
-
-#### Long-Term Plans
-In the long term, we aim to develop a comprehensive physics simulator focused on real-to-sim, serving as an easy-to-use platform for XR, VR, and robotics applications. **Feel free to reach out via email if you’re also interested in this direction and would like to collaborate on related research projects.**
-
+![TEASER](./assets/teaser.jpg)
 
 ### Setup
-#### 🐧Linux Setup
-```
-# Here we use cuda-12.1
-export PATH={YOUR_DIR}/cuda/cuda-12.1/bin:$PATH
-export LD_LIBRARY_PATH={YOUR_DIR}/cuda/cuda-12.1/lib64:$LD_LIBRARY_PATH
-# Create conda environment
-conda create -y -n phystwin python=3.10
-conda activate phystwin
 
-# Install the packages
-# If you only want to explore the interactive playground, you can skip installing Trellis, Grounding-SAM-2, RealSense, and SDXL.
-bash ./env_install/env_install.sh
+Follow the environment setup in the [PhysTwin](https://github.com/Jianghanxiao/PhysTwin/) repository (Linux / Windows / Docker, `env_install`, pretrained model download, and optional data download). MatPhys builds on the same stack and expects a working `phystwin` conda environment unless noted otherwise in a script.
 
-# Download the necessary pretrained models for data processing
-bash ./env_install/download_pretrained_models.sh
+For the original 22-case multi-view dataset (`data/different_types`), data processing follows PhysTwin's instructions. Once the cases are in place you can re-run preprocessing with `bash scripts/preprocess/multi_view_all.sh` and the PhysTwin per-edge baseline with the scripts under `scripts/baseline/` (see "Baseline" below).
+
+## Data preparation
+
+### Monocular video (MatPhys)
+
+```bash
+bash scripts/preprocess/single_video.sh <video> <case_name> <category> <device_id> \
+    [base_path] [results_dir] [phystwin_env] [cupid_env]
 ```
 
-#### 🪟Windows Setup
-Thanks to @GuangyanCai contributions, now we also have a windows setup codebase in `windows_setup` branch.
+Example:
 
-#### 🐳Docker Setup
-Thanks to @epiception contributions, we now have Docker support as well.
-```
-export DOCKER_USERNAME="your_alias" # default is ${whoami} (optional)
-chmod +x ./docker_scripts/build.sh
-./docker_scripts/build.sh
-
-# The script accepts architecture version from https://developer.nvidia.com/cuda-gpus as an additional argument
-./docker_scripts/build.sh 8.9+PTX # For NVIDIA RTX 40 series GPUs
+```bash
+bash scripts/preprocess/single_video.sh /data/clip.mp4 my_sloth sloth 0
 ```
 
-#### 🐧Linux Setup (RTX 5090 + CUDA 12.8 + Python 3.10 Specific)
-```
-# Here we use CUDA 12.8
-export PATH={YOUR_DIR}/cuda/bin:$PATH
-export LD_LIBRARY_PATH={YOUR_DIR}/cuda/lib64:$LD_LIBRARY_PATH
-export CUDA_HOME={YOUR_DIR}/cuda
+`<category>` is the GroundedSAM2 noun (`sloth`, `zebra`, …). Optional
+env vars: `MAX_FRAMES`, `FPS`, `START_SEC` (input truncation),
+`PROMPT_OVERRIDE` (override segmentation prompt),
+`TRAIN_FRAMES` (split point passed to `prepare_final_data_case.py`).
+Defaults: `base_path=data/single_view`, `results_dir=results`.
 
-# Create conda environment
-conda create -y -n phystwin python=3.10
-conda activate phystwin
+### 3DGS scaffold
 
-# Open gaussian_splatting/submodules/diff-gaussian-rasterization/cuda_rasterizer/rasterizer_impl.h and add an include directive for cstdint
-# Forcefully create a symbolic soft link between system libstdc++.so.6 and conda environment libstdc++.so.6 e.g. `ln -sf /usr/lib/x86_64-linux-gnu/libstdc++.so.6 {CONDA_PATH}/envs/phystwin/bin/../lib/libstdc++.so.6`
+After preprocessing, train per-case 3D Gaussians (one-off):
 
-# Install the packages (if you only want to explore the interactive playground, you can skip installing TRELLIS, Grounded-SAM-2, Grounding-DINO, RealSense, and SDXL)
-bash ./env_install/5090_env_install.sh
-
-# Download the necessary pretrained models for data processing
-bash ./env_install/download_pretrained_models.sh
+```bash
+bash scripts/preprocess/gs_train.sh         # train GS for all cases
+bash scripts/preprocess/gs_simulate.sh # simulation-ready GS
 ```
 
-### Download the PhysTwin Data
-Download the original data, processed data, and results into the project's root folder. (The following sections will explain how to process the raw observations and obtain the training results.)
-- [data](https://huggingface.co/datasets/Jianghanxiao/PhysTwin/resolve/main/data.zip): this includes the original data for different cases and the processed data for quick run. The different case_name can be found under `different_types` folder.
-- [experiments_optimization](https://huggingface.co/datasets/Jianghanxiao/PhysTwin/resolve/main/experiments_optimization.zip): results of our first-stage zero-order optimization.
-- [experiments](https://huggingface.co/datasets/Jianghanxiao/PhysTwin/resolve/main/experiments.zip): results of our second-order optimization.
-- [gaussian_output](https://huggingface.co/datasets/Jianghanxiao/PhysTwin/resolve/main/gaussian_output.zip): results of our static gaussian appearance.
-- [(optional) additional_data](https://huggingface.co/datasets/Jianghanxiao/PhysTwin/resolve/main/additional_data.zip): data for extra clothing demos not included in the original paper.
+### Semantic / material chain
 
-### Play with the Interactive Playground
-Use the previously constructed PhysTwin to explore the interactive playground. Users can interact with the pre-built PhysTwin using keyboard. The next section will provide a detailed guide on how to construct the PhysTwin from the original data.
+These produce the inputs consumed by the predictor (DINO features,
+part segmentation, material distribution, GPT physics priors). Each
+script accepts either an all-cases sweep or a single `<case_name>`.
 
-![example](./assets/sloth.gif)
-
-Run the interactive playground with our different cases (Need to wait some time for the first usage of interactive playground; Can achieve about 37 FPS using RTX 4090 on sloth case)
-
-```
-python interactive_playground.py \
-(--inv_ctrl) \
---n_ctrl_parts [1 or 2] \
---case_name [case_name]
-
-# Examples of usage:
-python interactive_playground.py --n_ctrl_parts 2 --case_name double_stretch_sloth
-python interactive_playground.py --inv_ctrl --n_ctrl_parts 2 --case_name double_lift_cloth_3
-```
-or in Docker
-```
-./docker_scripts/run.sh /path/to/data \
-                        /path/to/experiments \
-                        /path/to/experiments_optimization \
-                        /path/to/gaussian_output \
-# inside container
-conda activate phystwin_env
-python interactive_playground.py --inv_ctrl --n_ctrl_parts 2 --case_name double_lift_cloth_3
+```bash
+bash scripts/preprocess/semantic/lift_dino.sh   <device_id>            # lift DINOv2 to GS
+bash scripts/preprocess/semantic/sym.sh         <device_id>            # propagate by symmetry
+bash scripts/preprocess/semantic/material.sh    <device_id>            # part segmentation + material
+bash scripts/preprocess/semantic/extract_features.sh <base_path> <device_id>  # DINO features cache
+bash scripts/preprocess/semantic/extract_gpt_prior.sh   <OPENAI_API_KEY>          # GPT-4o priors
 ```
 
-Options: 
--   --inv_ctrl: inverse the control direction
--   --n_ctrol_parts: number of control panel (single: 1, double: 2) 
--   --case_name: case name of the PhysTwin case
+For Cupid reconstruction outside of `run_single_video.sh`:
 
-### Train the PhysTwin with the data
-Use the processed data to train the PhysTwin. Instructions on how to get above `experiments_optimization`, `experiments` and `gaussian_output` (Can adjust the code below to only train on several cases). After this step, you get the PhysTwin that can be used in the interactive playground.
-```
-# Zero-order Optimization
-python script_optimize.py
-
-# First-order Optimization
-python script_train.py
-
-# Inference with the constructed models
-python script_inference.py
-
-# Train the Gaussian with the first-frame data
-bash gs_run.sh
+```bash
+bash scripts/preprocess/semantic/cupid.sh <case_name> <device_id>
 ```
 
-### Evaluate the performance of the contructed PhysTwin
-To evaluate the performance of the constructed PhysTwin, need to render the images in the original viewpoint (similar logic to interactive playground)
-```
-# Use LBS to render the dynamic videos (The final videos in ./gaussian_output_dynamic folder)
-bash gs_run_simulate.sh
-python export_render_eval_data.py
-# Get the quantative results
-bash evaluate.sh
+## Baseline (PhysTwin per-edge optimization)
 
-# Get the qualitative results
-bash gs_run_simulate_white.sh
-python visualize_render_results.py
-```
+The PhysTwin baseline runs in three stages over the multi-view dataset.
 
-### Data Processing from Raw Videos
-The original data in each case only includes `color`, `depth`, `calibrate.pkl`, `metadata.json`. All other data are processed as below to get, including the projection, tracking and shape priors.
-(Note: Be aware of the conflict in the diff-gaussian-rasterization library between Gaussian Splatting and Trellis. For data processing, you don't need to install the gaussian splatting; ignore the last section in env_install.sh)
-```
-# Process the data
-python script_process_data.py
+```bash
+# stage 1: CMA-ES global optimization
+bash scripts/baseline/optimize_cma.sh <case_name>          # one case
+bash scripts/baseline/optimize_cma_all.sh                  # all cases
 
-# Further get the data for first-frame Gaussian
-python export_gaussian_data.py
+# stage 2: per-edge first-order optimization
+bash scripts/baseline/train_warp.sh <case_name>
+bash scripts/baseline/train_warp_all.sh
 
-# Get human mask data for visualization and rendering evaluation
-python export_video_human_mask.py
+# inference: roll out optimized params
+bash scripts/baseline/inference_warp.sh <case_name>
+bash scripts/baseline/inference_warp_all.sh
 ```
 
-### Control Force Visualization
-Visualize the force applied by the hand to the object as inferred from our PhysTwin model, based solely on video data.
-```
-python visualize_force.py \
---n_ctrl_parts [1 or 2] \
---case_name [case_name]
+Each `*_all.sh` enumerates cases via `<base_path>/*` (default
+`data/different_types`). Outputs land under `experiments/<case>/`
+(predictions) and `experiments_optimization/<case>/` (optimization
+intermediates).
 
-# Examples of usage:
-python visualize_force.py --case_name single_push_rope_1 --n_ctrl_parts 1 
-python visualize_force.py --case_name single_clift_cloth_1 --n_ctrl_parts 1    
-python visualize_force.py --case_name double_stretch_sloth 
-```
-The visualziation video is saved under `experiments` folder.
+## Training (Ours)
 
-### Material Visualization
-Experimental feature to visualize the approximated material from the constructed PhysTwin.
-```
-python visualize_material.py \
---case_name [case_name]
+The final recipe is **per-case fitting with smooth/damp regularizer**.
 
-# Examples of usage:
-python visualize_material.py --case_name double_lift_cloth_1
-python visualize_material.py --case_name single_push_rope
-python visualize_material.py --case_name double_stretch_sloth
+### Single case
+
+```bash
+bash scripts/ours/train_single.sh <case_name> <device_id> \
+    [base_path] [case_to_material] [save_root] [epochs]
 ```
 
+Example for a single-video case:
 
-### Multiple Objects Demos
-Try the experimental features for handling collisions among the multiple PhysTwins we construct.
-
-```
-# The stuff is deployed in the 'claw_matchine' branch
-git pull
-git checkout claw_machine
-
-# Play with the examples
-python interactive_playground.py --n_ctrl_parts 1 --case_name single_push_rope_1 --n_dup 4
-python interactive_playground.py --n_ctrl_parts 2 --case_name double_stretch_sloth --n_dup 2
+```bash
+bash scripts/ours/train_single.sh monkey 0 \
+    data/single_view semantic/case_to_material_monkey_only.json \
+    checkpoints/monkey_ours 200
 ```
 
-### Web-based Visualization for headless-server
-This feature is contributed by @CAN-Lee—many thanks to the community for the effort (Pull Request #43).
+Useful env-var overrides: `OBJECT_RADIUS` (default `0.02`),
+`CONTROLLER_RADIUS` (default `0.04`).
 
-![Gradio_support](./assets/gradio_support.png)
+### All 22 multi-view cases
 
-Try the experimental features for setting up an interactive playground on a server and accessing it through a web browser.
-
-```
-# The stuff is deployed in the `gradio_playground` branch
-git pull
-git checkout gradio_playground
-
-python interactive_playground_gradio.py \
-     --case_name double_lift_cloth_3 \
-     --n_ctrl_parts 2  \
-     --inv_ctrl \
-     --server_port 7860 \
-     --share
+```bash
+bash scripts/ours/train_all.sh
 ```
 
-### Follow-up and Potential Collaborations  
-If you are interested in collaborating or extending this work for your research, feel free to contact us at `hanxiao.jiang@columbia.edu`.  
+Shards cases across GPUs `1,4,5,6,7` (LPT-balanced by frame count).
+Saves to `checkpoints/per_case_smooth_fitall_<DATE_TAG>/<case>/`.
+Override with `DATE_TAG=...` and edit the `GPUx_CASES` arrays.
 
-## Projects Developed or Benchmarked with PhysTwin
-* **[NovaFlow: Zero-Shot Manipulation via Actionable Flow from Generated Videos](https://novaflow.lhy.xyz/)**
-* **[Real-to-Sim Robot Policy Evaluation with Gaussian Splatting Simulation of Soft-Body Interactions](https://real2sim-eval.github.io/)**
-* **[PhysWorld: From Real Videos to World Models of Deformable Objects via Physics-Aware Demonstration Synthesis](https://arxiv.org/abs/2510.21447)**
-* **[NeuSpring: Neural Spring Fields for Reconstruction and Simulation of Deformable Objects from Videos](https://arxiv.org/abs/2511.08310)**
-* ...
+Each run uses
+`semantic/train_model_video_material_simple.py` with:
 
-### Citation
-If you find this repo useful for your research, please consider citing the paper
+| flag | value | role |
+|---|---|---|
+| `--lambda_track` / `--lambda_geo` | `1.0` | warp rollout supervision |
+| `--lambda_render` | `0` | masked GS render L1 (off) |
+| `--lambda_phys_prior` | `1e-3` | GPT μ/σ/conf prior |
+| `--lambda_acc_smooth` | `1e-2` | anti-vibration regularizer |
+| `--logk_soft_clamp` | `0.25` | clamp on residual around prior |
+| `--fit_all_frames` | — | fit train + test frames (per-case fit) |
+
+### Anti-vibration ablation
+
+```bash
+GPU=0 CASE=single_push_sloth bash scripts/ours/ablation_smooth_damp.sh
 ```
-@article{jiang2025phystwin,
-    title={PhysTwin: Physics-Informed Reconstruction and Simulation of Deformable Objects from Videos},
-    author={Jiang, Hanxiao and Hsu, Hao-Yu and Zhang, Kaifeng and Yu, Hsin-Ni and Wang, Shenlong and Li, Yunzhu},
-    journal={ICCV},
-    year={2025}
-}
+
+Four cells (bugfix-only / +acc_smooth / +damp_barrier / +both) on one
+case; ~2–3h each on a single GPU.
+
+### Inference
+
+Roll out a trained checkpoint on the chosen split and dump metrics
+next to the ckpt:
+
+```bash
+bash scripts/ours/inference.sh <ckpt> [device] [split] [cases]
+# VIS=1 bash scripts/ours/inference.sh <ckpt>   # also dumps per-case .mp4 alongside the metrics
 ```
+
+## Evaluation
+
+```bash
+bash scripts/eval/evaluate.sh                        # all cases
+bash scripts/eval/evaluate.sh --case_name <case>     # single case
+```
+
+Runs three metrics:
+
+- `evaluate_chamfer.py` → `results/final_results.csv`
+- `evaluate_track.py`   → `results/final_track.csv`
+- `gaussian_splatting/evaluate_render.py` → render PSNR/SSIM/LPIPS
+
+For comparisons against the first-order per-edge optimization baseline
+(stored in `experiments_optimization/`), roll out predictions with
+`inference_warp.py` or `semantic/eval_simple_video.py` and feed them
+through the same evaluator. Always compare against the second-stage
+per-edge first-order optimization, not against the cotracker
+pseudo-GT.
+
+## Visualization
+
+```bash
+python scripts/viz/tracking_overlay.py     # overlay tracking on video
+python scripts/viz/sidebyside.py                    # side-by-side comparison video
+python scripts/viz/keyframe_blends.py  # keyframe blends for figures
+```
+
+For interactive inspection: `interactive_playground.py`,
+`scripts/viz/material.py`, `scripts/viz/render_results.py`,
+`semantic/visualize_inference.py`.
+
+## Layout notes
+
+- Per-case predictor: `semantic/train_model_video_material_simple.py`
+  (trainer) + `semantic/models.py` (decoder) +
+  `semantic/material_param_dataset.py` (graph dataset).
+- Warp simulator: `qqtt/model/diff_simulator/spring_mass_warp.py`,
+  driven by `qqtt/engine/trainer_warp.py`.
+- 3DGS render-loss path: `semantic/train_models.gaussian_render_l1_loss`.
+- Reference per-edge optimizer (baseline): `qqtt/engine/cma_optimize_warp.py`.

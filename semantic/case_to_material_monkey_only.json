@@ -1,0 +1,12 @@
+{
+  "class_to_id": {
+    "sloth": 0,
+    "zebra": 1,
+    "cloth": 2,
+    "rope": 3,
+    "dinosor": 4
+  },
+  "case_to_material": {
+    "monkey": "sloth"
+  }
+}

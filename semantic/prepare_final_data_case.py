@@ -7,6 +7,71 @@ import pickle
 import numpy as np
 from PIL import Image
 
+try:
+    import trimesh
+except ImportError:
+    trimesh = None
+
+
+def _as_mesh(m):
+    if isinstance(m, trimesh.Scene):
+        if len(m.geometry) == 0:
+            return None
+        return trimesh.util.concatenate(list(m.geometry.values()))
+    return m
+
+
+def _sample_mesh_surface_interior(mesh_path, num_surface, num_interior):
+    """Return (surface[Ns,3], interior[Ni,3]) sampled from a closed mesh."""
+    if trimesh is None or not os.path.isfile(mesh_path):
+        return None, None
+    mesh = _as_mesh(trimesh.load(mesh_path, force="mesh"))
+    if mesh is None or len(mesh.vertices) == 0:
+        return None, None
+    surf, _ = trimesh.sample.sample_surface(mesh, num_surface)
+    interior = trimesh.sample.volume_mesh(mesh, num_interior)
+    return np.asarray(surf, np.float32), np.asarray(interior, np.float32)
+
+
+def _voxel_dedupe(object_points_t0, surface_points, interior_points, voxel):
+    """Replicate data_process_sample.py voxel dedupe: prefer object > surface > interior.
+
+    Returns (kept_obj_idx, kept_surface, kept_interior).
+    """
+    cands = [object_points_t0]
+    if surface_points is not None and surface_points.size:
+        cands.append(surface_points)
+    if interior_points is not None and interior_points.size:
+        cands.append(interior_points)
+    all_pts = np.concatenate(cands, axis=0)
+    min_bound = all_pts.min(axis=0)
+    grid_flag = {}
+    kept_obj_idx = []
+    for i in range(object_points_t0.shape[0]):
+        gi = tuple(np.floor((object_points_t0[i] - min_bound) / voxel).astype(int))
+        if gi not in grid_flag:
+            grid_flag[gi] = 1
+            kept_obj_idx.append(i)
+    kept_surface = []
+    if surface_points is not None and surface_points.size:
+        for i in range(surface_points.shape[0]):
+            gi = tuple(np.floor((surface_points[i] - min_bound) / voxel).astype(int))
+            if gi not in grid_flag:
+                grid_flag[gi] = 1
+                kept_surface.append(surface_points[i])
+    kept_interior = []
+    if interior_points is not None and interior_points.size:
+        for i in range(interior_points.shape[0]):
+            gi = tuple(np.floor((interior_points[i] - min_bound) / voxel).astype(int))
+            if gi not in grid_flag:
+                grid_flag[gi] = 1
+                kept_interior.append(interior_points[i])
+    return (
+        np.asarray(kept_obj_idx, dtype=np.int64),
+        np.asarray(kept_surface, dtype=np.float32).reshape(-1, 3),
+        np.asarray(kept_interior, dtype=np.float32).reshape(-1, 3),
+    )
+
 
 def _load_array(path, key=None):
     if path.endswith(".npy"):
@@ -28,6 +93,12 @@ def _load_array(path, key=None):
 def _load_optional_array(path, key=None):
     if path is None:
         return None
+    if path.endswith(".npz") and key is not None:
+        # Tolerate missing key in npz so the caller can fall back to defaults.
+        data = np.load(path)
+        if key not in data:
+            return None
+        return data[key]
     return _load_array(path, key=key)
 
 
@@ -73,6 +144,12 @@ def main():
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--train_frames", type=int, default=None)
+    parser.add_argument("--mesh_path", default=None,
+                        help="Cupid mesh for surface+interior sampling. Default: <results_dir>/<case>/cupid/mesh0.glb")
+    parser.add_argument("--num_surface_points", type=int, default=1024)
+    parser.add_argument("--num_interior_points", type=int, default=10000)
+    parser.add_argument("--volume_sample_size", type=float, default=0.005,
+                        help="Voxel size for dedupe (m). 0 disables sampling.")
     args = parser.parse_args()
 
     case_dir = os.path.join(args.base_path, args.case_name)
@@ -139,14 +216,46 @@ def main():
 
     surface_points = _load_optional_array(args.surface_points, key=args.surface_points_key)
     interior_points = _load_optional_array(args.interior_points, key=args.interior_points_key)
+    if surface_points is not None:
+        surface_points = surface_points.astype(np.float32).reshape(-1, 3)
+    if interior_points is not None:
+        interior_points = interior_points.astype(np.float32).reshape(-1, 3)
+
+    # If user didn't supply surface/interior, sample them from the Cupid mesh
+    # (mirrors multi-view data_process_sample.py with shape_prior).
+    if (surface_points is None or interior_points is None) and args.volume_sample_size > 0:
+        mesh_path = args.mesh_path or os.path.join(
+            args.results_dir, args.case_name, "cupid", "mesh0.glb"
+        )
+        sp, ip = _sample_mesh_surface_interior(
+            mesh_path, args.num_surface_points, args.num_interior_points
+        )
+        if sp is not None:
+            print(f"[prepare] sampled {sp.shape[0]} surface + {ip.shape[0]} interior from {mesh_path}")
+            if surface_points is None:
+                surface_points = sp
+            if interior_points is None:
+                interior_points = ip
+        else:
+            print(f"[prepare] mesh not found at {mesh_path}; leaving surface/interior empty")
     if surface_points is None:
         surface_points = np.zeros((0, 3), dtype=np.float32)
-    else:
-        surface_points = surface_points.astype(np.float32).reshape(-1, 3)
     if interior_points is None:
         interior_points = np.zeros((0, 3), dtype=np.float32)
-    else:
-        interior_points = interior_points.astype(np.float32).reshape(-1, 3)
+
+    # Voxel-dedupe combined (object_points[0] > surface > interior), matching
+    # data_process_sample.py logic.
+    if args.volume_sample_size > 0 and (surface_points.size or interior_points.size):
+        kept_idx, surface_points, interior_points = _voxel_dedupe(
+            object_points[0], surface_points, interior_points, args.volume_sample_size
+        )
+        if kept_idx.size != num_points:
+            print(f"[prepare] voxel dedupe: object {num_points} -> {kept_idx.size}")
+            object_points = object_points[:, kept_idx, :]
+            object_colors = object_colors[:, kept_idx, :]
+            object_visibilities = object_visibilities[:, kept_idx]
+            object_motions_valid = object_motions_valid[:, kept_idx]
+            num_points = kept_idx.size
 
     pose_json = args.pose_json or os.path.join(
         args.results_dir, args.case_name, "cupid", "pose.json"
@@ -177,14 +286,26 @@ def main():
     with open(os.path.join(case_dir, "final_data.pkl"), "wb") as f:
         pickle.dump(final_data, f)
 
-    split = {"train": [0, int(train_frames)], "test": [0, int(num_frames)]}
+    split = {
+        "frame_len": int(num_frames),
+        "train": [0, int(train_frames)],
+        "test": [int(train_frames), int(num_frames)],
+    }
     with open(os.path.join(case_dir, "split.json"), "w") as f:
         json.dump(split, f, indent=2)
 
     metadata = {
-        "WH": [[int(width), int(height)]],
+        "WH": [int(width), int(height)],
         "intrinsics": [intrinsic.tolist()],
+        "frame_num": int(num_frames),
+        "serial_numbers": ["single_view"],
     }
+    meta_video_path = os.path.join(case_dir, "meta_video.json")
+    if os.path.isfile(meta_video_path):
+        with open(meta_video_path, "r") as f:
+            mv = json.load(f)
+        if "target_fps" in mv:
+            metadata["fps"] = float(mv["target_fps"])
     with open(os.path.join(case_dir, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
 

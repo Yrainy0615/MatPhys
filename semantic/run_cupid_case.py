@@ -24,6 +24,7 @@ import imageio
 import numpy as np
 import torch
 from PIL import Image
+from huggingface_hub import snapshot_download
 
 os.environ["SPCONV_ALGO"] = "native"
 
@@ -186,7 +187,13 @@ def main():
     args = parser.parse_args()
 
     print("[init] Loading Cupid pipeline ...")
-    pipeline = Cupid3DPipeline.from_pretrained("hbb1/Cupid")
+    try:
+        cupid_model_path = snapshot_download("hbb1/Cupid", local_files_only=True)
+        print(f"[init] Using local Cupid snapshot: {cupid_model_path}")
+    except Exception:
+        cupid_model_path = snapshot_download("hbb1/Cupid")
+        print(f"[init] Downloaded Cupid snapshot: {cupid_model_path}")
+    pipeline = Cupid3DPipeline.from_pretrained(cupid_model_path)
     pipeline.cuda()
 
     if args.case_name:

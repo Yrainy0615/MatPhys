@@ -8,6 +8,26 @@ import cv2
 from .config import cfg
 
 
+def _open_video_writer(save_path, fps, width, height):
+    """Open a VideoWriter with codec fallback and explicit failure reporting."""
+    ext = os.path.splitext(save_path)[1].lower()
+    codec_candidates = ["mp4v", "avc1"] if ext == ".mp4" else ["MJPG", "mp4v", "avc1"]
+
+    last_error = None
+    for codec in codec_candidates:
+        fourcc = cv2.VideoWriter_fourcc(*codec)
+        writer = cv2.VideoWriter(save_path, fourcc, fps, (width, height))
+        if writer.isOpened():
+            return writer
+        writer.release()
+        last_error = codec
+
+    raise RuntimeError(
+        f"Failed to initialize VideoWriter for {save_path} "
+        f"(tried codecs: {', '.join(codec_candidates)}; last={last_error})"
+    )
+
+
 def _render_frame_projected(
     points,
     colors,
@@ -20,6 +40,11 @@ def _render_frame_projected(
     point_radius=2,
 ):
     """Headless fallback renderer: project points and splat colored circles."""
+    # Auto-scale Cupid-style normalized intrinsics ([0,1] image plane) to pixels.
+    intrinsic = np.asarray(intrinsic, dtype=np.float32).copy()
+    if intrinsic.shape == (3, 3) and float(np.max(np.abs(intrinsic[:2, :]))) <= 2.0:
+        intrinsic[0, :] *= float(width)
+        intrinsic[1, :] *= float(height)
     if overlay_path is not None and frame_idx is not None:
         image_path = f"{overlay_path}/{frame_idx}.png"
         overlay = cv2.imread(image_path)
@@ -138,8 +163,7 @@ def visualize_pc(
 
     # Initialize video writer if save_video is True
     if save_video:
-        fourcc = cv2.VideoWriter_fourcc(*"avc1")  # Codec for .mp4 file format
-        video_writer = cv2.VideoWriter(save_path, fourcc, FPS, (width, height))
+        video_writer = _open_video_writer(save_path, FPS, width, height)
 
     if controller_points is not None and not use_headless_fallback:
         controller_meshes = []

@@ -43,6 +43,11 @@ from PIL import Image
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 
+from physics_prior import (
+    default_part_physics_prior,
+    query_vlm_for_part_physics_prior,
+)
+
 # ---------------------------------------------------------------------------
 # Default material classes (common physics-relevant materials)
 # ---------------------------------------------------------------------------
@@ -774,6 +779,10 @@ def main():
                         help="Ollama LLaVA model name (default: llava:13b)")
     parser.add_argument("--skip_vlm", action="store_true",
                         help="Skip LLaVA, use uniform distribution")
+    parser.add_argument("--query_phys_prior", action="store_true",
+                        help="Query VLM for physics priors and store them in train_ready.pt")
+    parser.add_argument("--phys_llava_model", type=str, default=None,
+                        help="Ollama model name for physics prior queries (default: same as --llava_model)")
 
     args = parser.parse_args()
 
@@ -869,6 +878,41 @@ def main():
                       for i in sorted_idx if distributions[k,i] > 0.01]
         print(f"  cluster {k}: {', '.join(mats_parts)}")
 
+    # ---- physics prior with VLM -----------------------------------------------
+    part_phys_prior = default_part_physics_prior(K)
+    phys_prior_records = {"parts": []}
+
+    if args.query_phys_prior and not args.skip_vlm:
+        phys_model = args.phys_llava_model or args.llava_model
+        print(f"[physics-prior] querying LLaVA ({phys_model}) for part-level physics priors ...")
+        for k in range(K):
+            overlay_img, _, _ = render_cluster_on_image(
+                image_rgb, xyz, part_assignments, k, extrinsic, intrinsic
+            )
+            pred = query_vlm_for_part_physics_prior(
+                image_rgb,
+                overlay_img,
+                k,
+                model_name=phys_model,
+            )
+            part_phys_prior["part_phys_prior_mu"][k, 0] = float(pred["logk_mu"])
+            part_phys_prior["part_phys_prior_log_sigma"][k, 0] = float(np.log(max(pred["logk_sigma"], 1e-4)))
+            part_phys_prior["part_phys_prior_conf"][k, 0] = float(pred["confidence"])
+            phys_prior_records["parts"].append({
+                "part_id": k,
+                "logk_mu": float(pred["logk_mu"]),
+                "logk_sigma": float(pred["logk_sigma"]),
+                "confidence": float(pred["confidence"]),
+            })
+
+    print("[physics-prior] part priors:")
+    for k in range(min(K, 10)):
+        print(
+            f"  cluster {k}: mu={part_phys_prior['part_phys_prior_mu'][k,0].item():.3f}, "
+            f"sigma={part_phys_prior['part_phys_prior_log_sigma'][k,0].exp().item():.3f}, "
+            f"conf={part_phys_prior['part_phys_prior_conf'][k,0].item():.2f}"
+        )
+
     # ---- compute embeddings --------------------------------------------------
     print("[embed] computing mixture embeddings ...")
     material_embeddings = compute_mixture_embeddings(distributions, args.embed_dim)
@@ -920,6 +964,15 @@ def main():
     torch.save(embed_data, os.path.join(train_dir, "material_embeddings.pt"))
     print(f"  material_embeddings.pt ({K} x {args.embed_dim})")
 
+    phys_data = {
+        **part_phys_prior,
+        "records": phys_prior_records,
+    }
+    torch.save(phys_data, os.path.join(train_dir, "physics_prior.pt"))
+    with open(os.path.join(train_dir, "physics_prior.json"), "w") as f:
+        json.dump(phys_prior_records, f, indent=2)
+    print("  physics_prior.pt / physics_prior.json")
+
     # Combined training-ready data
     train_ready = {
         # Gaussian data
@@ -941,6 +994,11 @@ def main():
         "material_distributions": distributions,
         "material_embeddings": material_embeddings,
         "material_names": materials,
+
+        # Physics priors from VLM
+        "part_phys_prior_mu": part_phys_prior["part_phys_prior_mu"],
+        "part_phys_prior_log_sigma": part_phys_prior["part_phys_prior_log_sigma"],
+        "part_phys_prior_conf": part_phys_prior["part_phys_prior_conf"],
     }
     torch.save(train_ready, os.path.join(train_dir, "train_ready.pt"))
     print(f"  train_ready.pt (combined data)")

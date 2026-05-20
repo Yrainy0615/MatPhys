@@ -32,6 +32,16 @@ def load_camera_data(case_dir: str) -> Tuple[np.ndarray, np.ndarray]:
     with open(metadata_path, "r") as f:
         metadata = json.load(f)
     intrinsics = np.array(metadata["intrinsics"], dtype=np.float32)
+    # Match train_models._load_case_cfg: Cupid-style normalized intrinsics
+    # (fx,fy,cx,cy <= 2) are auto-scaled to pixel units.
+    if np.max(np.abs(intrinsics[:, :2, :])) <= 2.0:
+        wh = metadata.get("WH", None)
+        if isinstance(wh, list) and len(wh) == 2 and not isinstance(wh[0], list):
+            width, height = wh
+        else:
+            width, height = wh[0]
+        intrinsics[:, 0, :] *= float(width)
+        intrinsics[:, 1, :] *= float(height)
     w2cs = np.array([np.linalg.inv(c2w) for c2w in c2ws], dtype=np.float32)
     return w2cs, intrinsics
 
@@ -226,6 +236,16 @@ def load_camera_data(case_dir: str) -> Tuple[np.ndarray, np.ndarray]:
     with open(metadata_path, "r") as f:
         metadata = json.load(f)
     intrinsics = np.array(metadata["intrinsics"], dtype=np.float32)
+    # Match train_models._load_case_cfg: Cupid-style normalized intrinsics
+    # (fx,fy,cx,cy <= 2) are auto-scaled to pixel units.
+    if np.max(np.abs(intrinsics[:, :2, :])) <= 2.0:
+        wh = metadata.get("WH", None)
+        if isinstance(wh, list) and len(wh) == 2 and not isinstance(wh[0], list):
+            width, height = wh
+        else:
+            width, height = wh[0]
+        intrinsics[:, 0, :] *= float(width)
+        intrinsics[:, 1, :] *= float(height)
     w2cs = np.array([np.linalg.inv(c2w) for c2w in c2ws], dtype=np.float32)
     return w2cs, intrinsics
 

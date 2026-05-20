@@ -9,6 +9,39 @@ from tqdm import tqdm
 from PIL import Image
 from sam2.build_sam import build_sam2_video_predictor, build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+# Compatibility shims for transformers >= 5, which removed get_head_mask and changed
+# get_extended_attention_mask's signature (the old (mask, shape, device, dtype) became
+# (mask, shape, dtype)). GroundingDINO's BertModelWarper assumes the old API.
+from transformers import BertModel as _BertModel
+
+if not hasattr(_BertModel, "get_head_mask"):
+    def _gdino_get_head_mask(self, head_mask, num_hidden_layers, is_attention_chunked=False):
+        if head_mask is None:
+            return [None] * num_hidden_layers
+        if head_mask.dim() == 1:
+            head_mask = head_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+            head_mask = head_mask.expand(num_hidden_layers, -1, -1, -1, -1)
+        elif head_mask.dim() == 2:
+            head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+        if is_attention_chunked:
+            head_mask = head_mask.unsqueeze(-1)
+        return head_mask
+    _BertModel.get_head_mask = _gdino_get_head_mask
+
+# Always wrap get_extended_attention_mask to accept an optional `device` 3rd positional
+# argument (old API). If `device` is given, we silently drop it.
+_orig_get_extended_attention_mask = _BertModel.get_extended_attention_mask
+def _gdino_get_extended_attention_mask(self, attention_mask, input_shape, device_or_dtype=None, dtype=None):
+    # Old API: (attention_mask, input_shape, device, dtype)
+    # New API: (attention_mask, input_shape, dtype)
+    if isinstance(device_or_dtype, torch.device) or (isinstance(device_or_dtype, str) and not torch.is_tensor(device_or_dtype)):
+        effective_dtype = dtype
+    else:
+        effective_dtype = device_or_dtype if device_or_dtype is not None else dtype
+    return _orig_get_extended_attention_mask(self, attention_mask, input_shape, effective_dtype)
+_BertModel.get_extended_attention_mask = _gdino_get_extended_attention_mask
+
 from groundingdino.util.inference import load_model, load_image, predict
 import json
 from argparse import ArgumentParser
@@ -76,17 +109,16 @@ image_predictor = SAM2ImagePredictor(sam2_image_model)
 
 video_info = sv.VideoInfo.from_video_path(VIDEO_PATH)  # get video info
 print(video_info)
-frame_generator = sv.get_video_frames_generator(VIDEO_PATH, stride=1, start=0, end=None)
+frame_generator = sv.get_video_frames_generator(VIDEO_PATH)
 
 # saving video to frames
 source_frames = Path(SOURCE_VIDEO_FRAME_DIR)
 source_frames.mkdir(parents=True, exist_ok=True)
 
-with sv.ImageSink(
-    target_dir_path=source_frames, overwrite=True, image_name_pattern="{:05d}.jpg"
-) as sink:
-    for frame in tqdm(frame_generator, desc="Saving Video Frames"):
-        sink.save_image(frame)
+# supervision >=0.6 removed ImageSink — write frames manually.
+# Note: sv.get_video_frames_generator yields BGR np.ndarrays.
+for i, frame in enumerate(tqdm(frame_generator, desc="Saving Video Frames")):
+    cv2.imwrite(str(source_frames / f"{i:05d}.jpg"), frame)
 
 # scan all the JPEG frame names in this directory
 frame_names = [
