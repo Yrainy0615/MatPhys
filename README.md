@@ -31,6 +31,28 @@ Follow the environment setup in the [PhysTwin](https://github.com/Jianghanxiao/P
 
 For the original 22-case multi-view dataset (`data/different_types`), data processing follows PhysTwin's instructions. Once the cases are in place you can re-run preprocessing with `bash scripts/preprocess/multi_view_all.sh` and the PhysTwin per-edge baseline with the scripts under `scripts/baseline/` (see "Baseline" below).
 
+### Pretrained model
+
+Download the MatPhys pretrained weights ([`checkpoint_all_latest.pth` on Google Drive](https://drive.google.com/file/d/1UiZuOVdcGwAkuAeJlrSi24RxCEsZvzz1/view?usp=sharing)) and place them at:
+
+```text
+checkpoints/checkpoint_all_latest.pth
+```
+
+Use this checkpoint for inference or to export per-case physics parameters without retraining:
+
+```bash
+# Roll out on the test split (metrics written next to the ckpt)
+bash scripts/ours/inference.sh checkpoints/checkpoint_all_latest.pth cuda:0 test
+
+# Dump spring/collision params for interactive_playground.py
+python semantic/dump_physics_params.py \
+    --ckpt checkpoints/checkpoint_all_latest.pth \
+    --case_name <case> \
+    --base_path data/different_types \
+    --case_to_material semantic/case_to_material_different_types.json
+```
+
 ## Data preparation
 
 ### Monocular video (MatPhys)
