@@ -164,11 +164,8 @@ Each run uses
 | flag | value | role |
 |---|---|---|
 | `--lambda_track` / `--lambda_geo` | `1.0` | warp rollout supervision |
-| `--lambda_render` | `0` | masked GS render L1 (off) |
 | `--lambda_phys_prior` | `1e-3` | GPT μ/σ/conf prior |
 | `--lambda_acc_smooth` | `1e-2` | anti-vibration regularizer |
-| `--logk_soft_clamp` | `0.25` | clamp on residual around prior |
-| `--fit_all_frames` | — | fit train + test frames (per-case fit) |
 
 
 ### Inference
