@@ -33,7 +33,7 @@ For the original 22-case multi-view dataset (`data/different_types`), data proce
 
 ### Pretrained model
 
-Download the MatPhys pretrained weights ([`checkpoint_all_latest.pth` on Google Drive](https://drive.google.com/file/d/1UiZuOVdcGwAkuAeJlrSi24RxCEsZvzz1/view?usp=sharing)) and place them at:
+Download the MatPhys pretrained weights ([Google Drive](https://drive.google.com/file/d/1UiZuOVdcGwAkuAeJlrSi24RxCEsZvzz1/view?usp=sharing)) and place them at:
 
 ```text
 checkpoints/checkpoint_all_latest.pth
