@@ -58,9 +58,10 @@ def main():
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--out_tag", default="pretrained",
                    help="best_<tag>.pth (under experiments/<case>/train/)")
-    p.add_argument("--topology", choices=("ckpt", "knn", "radius"), default="knn",
-                   help="Spring graph topology. 'knn' matches inference_warp/playground (yaml default), "
-                        "'radius' matches simple-trainer training, 'ckpt' uses ckpt args.")
+    p.add_argument("--topology", choices=("ckpt", "knn", "radius"), default="ckpt",
+                   help="Spring graph topology. 'ckpt' (default) uses the topology the model was "
+                        "trained with — that's the only one whose per-edge predictions are in-distribution. "
+                        "'knn'/'radius' force-override and are only useful for diagnostics.")
     p.add_argument("--logk_base", type=float, default=None,
                    help="Override logk_base (default: model constructor default).")
     p.add_argument("--logk_min", type=float, default=None)
